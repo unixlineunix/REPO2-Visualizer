@@ -1,4 +1,4 @@
-# REPO2-Visualizer
+# REPO2-Visualizer (audio visualizer btw)
 - asked ai to make this for fun
 - I didn't write a single code
 - just use the 5 folder
