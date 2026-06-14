@@ -1,0 +1,21 @@
+#pragma once
+
+#if !defined(__EXTERNS__HERE)
+#define __EXTERNS__HERE
+
+#include "../Core/aCr_s"
+#include "../Core - extra/RSTD_ HF - Ex"
+
+namespace IDK {
+	extern IDK::c_cCX_MainApplctN vCX_uniM;
+	
+	extern bool GlbAppTerm_CX;
+	
+	extern bool AppTerm_CX_Check();
+
+	extern bool vkInitStp_1();
+	extern bool uf_CX_vkInitStp_1();
+	extern bool ctCX_vkInitStp_1(IDK::c_cCX_MainApplctN& ap_CX);
+
+}
+#endif

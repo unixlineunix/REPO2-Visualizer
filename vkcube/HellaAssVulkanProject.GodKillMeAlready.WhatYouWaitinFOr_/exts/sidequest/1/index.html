@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Rotator</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #0a0a0f;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        h1 { margin-bottom: 20px; color: #5599dd; }
+        .controls {
+            background: #1a1a25;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            width: 100%;
+            max-width: 600px;
+        }
+        .control-group {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+            gap: 10px;
+        }
+        label { min-width: 120px; }
+        input[type="number"], input[type="range"] {
+            flex: 1;
+            background: #0a0a0f;
+            border: 1px solid #333;
+            color: #fff;
+            padding: 8px;
+            border-radius: 4px;
+        }
+        input[type="range"] { padding: 0; }
+        input[type="file"] {
+            flex: 1;
+            color: #fff;
+        }
+        button {
+            background: #5599dd;
+            color: #fff;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        button:hover { background: #6699ee; }
+        #canvas-container {
+            position: relative;
+            background: #1a1a25;
+            border-radius: 8px;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 400px;
+        }
+        #canvas {
+            max-width: 100%;
+            max-height: 70vh;
+            image-rendering: crisp-edges;
+        }
+        #deg-display {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 18px;
+            font-weight: bold;
+            color: #5599dd;
+        }
+    </style>
+</head>
+<body>
+    <h1>Image Rotator</h1>
+    
+    <div class="controls">
+        <div class="control-group">
+            <label>Image:</label>
+            <input type="file" id="imageInput" accept="image/*">
+        </div>
+        
+        <div class="control-group">
+            <label>Degrees:</label>
+            <input type="range" id="degSlider" min="0" max="360" value="0" step="0.1">
+            <input type="number" id="degInput" min="0" max="360" value="0" step="0.1">
+        </div>
+        
+        <div class="control-group">
+            <label>Output Width:</label>
+            <input type="number" id="outWidth" value="512" min="1">
+        </div>
+        
+        <div class="control-group">
+            <label>Output Height:</label>
+            <input type="number" id="outHeight" value="512" min="1">
+        </div>
+        
+        <div class="control-group">
+            <button id="exportBtn">Export PNG</button>
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <div id="deg-display">deg: 0.0</div>
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <script>
+        const imageInput = document.getElementById('imageInput');
+        const degSlider = document.getElementById('degSlider');
+        const degInput = document.getElementById('degInput');
+        const outWidth = document.getElementById('outWidth');
+        const outHeight = document.getElementById('outHeight');
+        const exportBtn = document.getElementById('exportBtn');
+        const degDisplay = document.getElementById('deg-display');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d', { alpha: false });
+
+        let img = null;
+        let rotation = 0;
+
+        degSlider.addEventListener('input', e => {
+            rotation = parseFloat(e.target.value);
+            degInput.value = rotation.toFixed(1);
+            render();
+        });
+
+        degInput.addEventListener('input', e => {
+            rotation = parseFloat(e.target.value) || 0;
+            degSlider.value = rotation;
+            render();
+        });
+
+        imageInput.addEventListener('change', e => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = ev => {
+                img = new Image();
+                img.onload = () => {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    outWidth.value = img.width;
+                    outHeight.value = img.height;
+                    render();
+                };
+                img.src = ev.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        function render() {
+            if (!img) return;
+            
+            degDisplay.textContent = `deg: ${rotation.toFixed(1)}`;
+            
+            ctx.save();
+            ctx.fillStyle = '#0a0a0f';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.translate(canvas.width / 2, canvas.height / 2);
+            ctx.rotate(rotation * Math.PI / 180);
+            ctx.drawImage(img, -img.width / 2, -img.height / 2, img.width, img.height);
+            ctx.restore();
+        }
+
+        exportBtn.addEventListener('click', () => {
+            if (!img) {
+                alert('Load an image first');
+                return;
+            }
+
+            const w = parseInt(outWidth.value) || img.width;
+            const h = parseInt(outHeight.value) || img.height;
+            
+            const exportCanvas = document.createElement('canvas');
+            exportCanvas.width = w;
+            exportCanvas.height = h;
+            const ectx = exportCanvas.getContext('2d', { alpha: true });
+            
+            ectx.save();
+            ectx.translate(w / 2, h / 2);
+            ectx.rotate(rotation * Math.PI / 180);
+            
+            const scale = Math.min(w / img.width, h / img.height);
+            const sw = img.width * scale;
+            const sh = img.height * scale;
+            ectx.drawImage(img, -sw / 2, -sh / 2, sw, sh);
+            ectx.restore();
+            
+            exportCanvas.toBlob(blob => {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'rotated.png';
+                a.click();
+                URL.revokeObjectURL(url);
+            });
+        });
+
+        // Load a default placeholder
+        img = new Image();
+        img.onload = () => {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            render();
+        };
+        img.src = 'data:image/svg+xml,' + encodeURIComponent('<svg width="512" height="512" xmlns="http://www.w3.org/2000/svg"><rect fill="#1a1a25" width="512" height="512"/><text x="256" y="256" font-size="24" fill="#5599dd" text-anchor="middle" dominant-baseline="middle">Load an image</text></svg>');
+    </script>
+</body>
+</html>

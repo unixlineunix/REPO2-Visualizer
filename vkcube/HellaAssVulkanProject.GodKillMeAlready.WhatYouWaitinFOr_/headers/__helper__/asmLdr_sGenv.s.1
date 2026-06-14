@@ -1,0 +1,28 @@
+#pragma once
+
+#ifndef S_FNC_GENV_HPP
+#define S_FNC_GENV_HPP
+#include "asmLdr_sTypesStr.s.1"
+
+// 1. Declare the out-of-file assembly module function signature hook
+extern "C" {
+    const char* ctCX_GetEnv(const char* name);
+}
+
+namespace rstd {
+
+    // ... (Keep your current Ostream, cout, cerr, endl, and flush completely intact here)
+
+    // 2. Add the dynamic lookup handler method right under your stream variables
+    inline rstd::aString getenv(const char* var_name) {
+        if (!var_name) return rstd::aString();
+        
+        const char* value_ptr = ctCX_GetEnv(var_name);
+        if (value_ptr) {
+            return rstd::aString(value_ptr); // Direct constructor assignment loads and copies text automatically
+        }
+        return rstd::aString(); // Return completely empty blank object if lookup falls flat
+    }
+}
+
+#endif

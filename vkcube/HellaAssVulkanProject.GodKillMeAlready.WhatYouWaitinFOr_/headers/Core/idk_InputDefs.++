@@ -1,0 +1,48 @@
+#pragma once
+
+#ifndef _IDK_INPUT_DEFS_HPP
+#define _IDK_INPUT_DEFS_HPP
+
+namespace IDK {
+
+    enum class InputState : int {
+        IDLE     = 0,
+        PRESSED  = 1,
+        HELD     = 2,
+        RELEASED = 3,
+        REPEATED = 4 // The 4th one (mostly for KB)
+    };
+
+    enum class Key : int {
+        UNKNOWN = 0,
+        A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+        N0, N1, N2, N3, N4, N5, N6, N7, N8, N9,
+        F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+        ESCAPE, SPACE, ENTER, TAB, BACKSPACE, CAPS_LOCK, NUM_LOCK, SCROLL_LOCK,
+        LEFT_SHIFT, RIGHT_SHIFT, LEFT_CTRL, RIGHT_SHIFT_IDK, RIGHT_CTRL, LEFT_ALT, RIGHT_ALT,
+        LEFT_SUPER, RIGHT_SUPER,
+        UP, DOWN, LEFT, RIGHT,
+        INSERT, DEL, HOME, END, PAGE_UP, PAGE_DOWN,
+        
+        // Symbols (The ones you wanted directly)
+        EXCLAMATION, AT, HASH, DOLLAR, PERCENT, CARET, AMPERSAND, ASTERISK, PAREN_LEFT, PAREN_RIGHT,
+        MINUS, EQUAL, PLUS, UNDERSCORE,
+        BRACKET_LEFT, BRACKET_RIGHT, BRACE_LEFT, BRACE_RIGHT,
+        SEMICOLON, COLON, QUOTE, DOUBLE_QUOTE,
+        COMMA, PERIOD, SLASH, QUESTION, BACKSLASH, PIPE, BACKTICK, TILDE,
+        
+        COUNT // Total count
+    };
+
+    enum class MouseButton : int {
+        LEFT = 0,
+        RIGHT,
+        MIDDLE,
+        EXTRA1,
+        EXTRA2,
+        COUNT
+    };
+
+} // namespace idk
+
+#endif

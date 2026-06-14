@@ -1,0 +1,96 @@
+#pragma once
+
+#if !defined(____BASIC_WINDOW__PROVIDER__WAYLAND__)
+#define ___BASIC_WINDOW__PROVIDER__WAYLAND__
+#include "../Core - extra/RSTD_ HF - Ex"
+
+class idk
+{
+	private:
+		using uint32_t = unsigned int;
+
+	public:
+    struct WindowDesc
+    {
+        rstd::aString title;
+        rstd::aString appId;
+
+        uint32_t width  = 1280;
+        uint32_t height = 720;
+
+        bool decorated = false;
+        bool resizable = true;
+        bool visible   = true;
+    };
+
+    enum class WindowState
+    {
+        Normal,
+        Maximized,
+        Fullscreen
+    };
+
+    struct WindowSize
+    {
+        uint32_t width;
+        uint32_t height;
+    };
+
+    class Window
+    {
+    public:
+
+        static bool Initialize();
+        static void Shutdown();
+
+        static void PollEvents();
+        static void Sync();
+
+        static Window* Create(
+            const WindowDesc& desc);
+
+        static void Destroy(
+            Window* window);
+
+    public:
+
+        bool ShouldClose() const;
+
+        void Close();
+
+        void Show();
+        void Hide();
+
+        void Focus();
+
+        void SetTitle(
+            const rstd::aString& title);
+
+        void SetWaylandAppId(
+            const rstd::aString& appId);
+
+        void SetSize(
+            uint32_t width,
+            uint32_t height);
+
+        WindowSize GetSize() const;
+
+        void SetState(
+            WindowState state);
+
+        WindowState GetState() const;
+
+        bool IsFocused() const;
+        bool IsVisible() const;
+
+        void* GetNativeDisplay() const;
+        void* GetNativeSurface() const;
+
+    private:
+
+        Window() = default;
+        ~Window() = default;
+    };
+};
+
+#endif

@@ -1,0 +1,6 @@
+#pragma once
+
+#include <vulkan/vulkan.hpp>
+#include <vulkan/vulkan_wayland.h>
+#include "Core/s_WindowProvider_idk"
+//#include <GLFW/glfw3.h>

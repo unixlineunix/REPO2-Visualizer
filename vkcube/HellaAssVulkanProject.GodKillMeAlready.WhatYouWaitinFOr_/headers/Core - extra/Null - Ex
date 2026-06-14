@@ -1,0 +1,14 @@
+// Idk just felt like making this shit
+
+#include "../Core/s_WindowProvider_idk"
+
+namespace WP {
+	inline bool s_sCX_windowIntiCheck(WP::wWindow_s winow){
+		if (winow.getDisplay() == nullptr){
+			rstd::ansi::CnsChr::RTUI::s_uf_CXerr("sCX_WP_", "Window Failed To initialize.");
+		}
+		else {
+			return true;
+		}
+	}
+}

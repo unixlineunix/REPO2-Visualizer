@@ -1,0 +1,62 @@
+#pragma once
+
+#if !defined(__CR_SE__C1)
+#define __CR_SE__C1
+
+//#include "s_WindowProvider_idk"
+#include "../Core - extra/Null - Ex"
+#include "../Utility/ex2rn"
+//#include "../Utility/externs"
+
+// Bruh 
+
+namespace IDK{
+
+	class c_cCX_MainApplctN {
+		public:
+			void sCX_vkI_aLaunch(){  		// Basically run()
+				sCX_vk_Initialize();
+				sCX_vk_MainLoop();
+				sCX_vk_cClean();
+
+				InitIalized = true; 		// Aint gotta use the sh** naming on everything though
+			}
+
+			void fCX_changeWindowSize(int wid, int height) {
+				if (InitIalized && wid > 1 && height > 1){
+					IDK::sCX_IDK_wayland_window_.setWindowSize(wid, height);
+				}
+			}
+
+		private:
+			bool InitIalized = false;
+
+			void sCX_vk_WindowInitl(){		// Basically initWindow
+				IDK::sCX_IDK_wayland_window_.init();
+
+				// Checking window initialization i guess
+				try {
+					WP::s_sCX_windowIntiCheck(sCX_IDK_wayland_window_);
+				} catch (rstd::exception& e) {
+					rstd::cout << e.what();
+				}
+				
+				
+			}
+
+			void sCX_vk_Initialize(){		// Basica initVulkan
+
+			}
+
+			void sCX_vk_MainLoop(){			// MainLoop
+				IDK::sCX_IDK_wayland_window_.run();
+			}
+
+			void sCX_vk_cClean(){			// Cleanup
+
+			}
+	};
+
+}
+
+#endif

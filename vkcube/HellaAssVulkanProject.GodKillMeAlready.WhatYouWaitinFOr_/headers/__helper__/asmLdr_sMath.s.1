@@ -1,0 +1,38 @@
+#pragma once
+
+#ifndef RSTD_MATH_LOADER_HPP
+#define RSTD_MATH_LOADER_HPP
+
+// x87 FPU asm math functions
+extern "C" {
+    float asm_sinf(float x);
+    float asm_cosf(float x);
+    float asm_tanf(float x);
+    float asm_sqrtf(float x);
+    float asm_atan2f(float y, float x);
+    float asm_acosf(float x);
+    float asm_asinf(float x);
+    float asm_atanf(float x);
+    float asm_powf(float x, float y);
+    float asm_fabsf(float x);
+    float asm_fmodf(float x, float y);
+    float asm_copysignf(float mag, float sign);
+}
+
+namespace rstd {
+    // Wrap asm functions in rstd namespace for convenience
+    inline float sin(float x)   { return asm_sinf(x); }
+    inline float cos(float x)   { return asm_cosf(x); }
+    inline float tan(float x)   { return asm_tanf(x); }
+    inline float sqrt(float x)  { return asm_sqrtf(x); }
+    inline float atan2(float y, float x) { return asm_atan2f(y, x); }
+    inline float acos(float x)  { return asm_acosf(x); }
+    inline float asin(float x)  { return asm_asinf(x); }
+    inline float atan(float x)  { return asm_atanf(x); }
+    inline float pow(float x, float y) { return asm_powf(x, y); }
+    inline float fabs(float x)  { return asm_fabsf(x); }
+    inline float fmod(float x, float y) { return asm_fmodf(x, y); }
+    inline float copysign(float m, float s) { return asm_copysignf(m, s); }
+}
+
+#endif

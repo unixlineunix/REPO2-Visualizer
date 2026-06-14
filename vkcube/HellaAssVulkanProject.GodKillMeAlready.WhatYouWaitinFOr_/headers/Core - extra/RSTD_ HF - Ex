@@ -1,0 +1,114 @@
+#pragma once
+
+#ifndef RSTD_HF_EX
+#define RSTD_HF_EX
+
+// Include it
+#include "../__helper__/asmLdr_sGenv.s.1"
+#include "../__helper__/asmLdr_sMath.s.1"
+#include "../__helper__/asmLdr_sUnistd.s.1"
+
+namespace rstd {
+// --- Raw Stream Processing Pipeline Engine ---
+
+    class Ostream;
+    
+    // CORRECT SYSTEM ALIAS: Explicitly targets a const Ostream reference stream loop.
+    // This fully synchronizes the streaming pipeline left-to-right to clear all Code 312 errors.
+    using Manipulator = const Ostream& (*)(const Ostream&);
+
+    class Ostream {
+        private:
+            int fd; // 1 = STDOUT, 2 = STDERR
+
+        public:
+            inline constexpr Ostream(int file_descriptor) : fd(file_descriptor) {}
+
+            // Added 'const' to method signatures to resolve the IntelliSense mismatch
+            inline const Ostream& operator<<(const char* text) const {
+                asm_rawPrintStr(fd, text);
+                return *this;
+            }
+
+            inline const Ostream& operator<<(const aString& str) const {
+                asm_rawPrintDynStr(fd, str.get_struct_ptr());
+                return *this;
+            }
+
+            inline const Ostream& operator<<(long long number) const {
+                asm_rawPrintInt(fd, number);
+                return *this;
+            }
+
+            // CORRECT FIXED: Passes the const reference directly into the using alias function pointer
+            inline const Ostream& operator<<(Manipulator m) const {
+                return m(*this);
+            }
+
+            inline int get_fd() const { return fd; }
+        };
+
+        // Fixed: Use standard 'inline const' declarations instead of 'constexpr' 
+        // to maintain constant globally accessible references without parsing violations
+        inline const Ostream cout(1);
+        inline const Ostream cerr(2);
+        
+        // CORRECT FIXED: Synchronized parameter signatures to perfectly bind with the using alias
+        inline const Ostream& endl(const Ostream& os) {
+            asm_rawPrintStr(os.get_fd(), "\n");
+            return os;
+        }
+
+        // CORRECT FIXED: Synchronized parameter signatures to perfectly bind with the using alias
+        inline const Ostream& flush(const Ostream& os) {
+            return os;
+        }
+
+        // ─── HIGH-PERFORMANCE GETENV SYSTEM HOOK ───
+        //  inline rstd::aString getenv(const char* var_name) {
+        //      if (!var_name) return rstd::aString();
+        //      const char* value_ptr = ctCX_GetEnv(var_name);
+        //      if (value_ptr) {
+        //          return rstd::aString(value_ptr);
+        //      }
+        //      return rstd::aString();
+        //  }
+        
+        // ─── HIGH-PERFORMANCE INT-TO-STRING CASTING UTILITY ───
+        // Converts a number to an aString inline, allowing direct '+' concatenation right after it
+        inline rstd::aString to_aString(long long number) {
+            // Invokes your integer assignment constructor to convert digits via assembly
+            return rstd::aString(number); 
+        }
+
+        // ─── HIGH-PERFORMANCE EXCEPTION BASE INTERFACE ───
+        // Replaces standard std::exception with a zero-overhead object layer
+        class exception {
+        public:
+            inline exception() {}
+            inline virtual ~exception() {}
+    
+            // Virtual contract requiring derived types to return a null-terminated pointer.
+            // Mimics std::exception::what() flawlessly.
+            virtual const char* what() const noexcept = 0;
+        };
+    
+        // ─── CONCRETE VULKAN RUNTIME EXCEPTION ENGINE ───
+        class runtime_error : public exception {
+        private:
+            rstd::aString message_buffer; // Dynamic memory canvas tracking the exact crash details
+    
+        public:
+            // Constructor converts custom string payloads into locked heap buffers
+            inline runtime_error(const char* message) : message_buffer(message) {}
+            inline runtime_error(const rstd::aString& message) : message_buffer(message) {}
+    
+            // Overrides contract to hand back raw memory address pointer locations to your logger
+            inline const char* what() const noexcept override {
+                // Reaches directly into Offset 0 of your assembly structural data block
+                return const_cast<rstd::aString&>(message_buffer).c_str();
+            }
+        };
+}
+
+#endif // RSTD_HF_EX

@@ -1,0 +1,22 @@
+#pragma once
+
+#ifndef RSTD_UNISTD_LOADER_HPP
+#define RSTD_UNISTD_LOADER_HPP
+
+extern "C" {
+    int  asm_close(int fd);
+    int  asm_ftruncate(int fd, long length);
+    int  asm_unlink(const char* path);
+    long asm_write(int fd, const void* buf, unsigned long count);
+    long asm_read(int fd, void* buf, unsigned long count);
+}
+
+namespace rstd {
+    inline int  close(int fd)                              { return asm_close(fd); }
+    inline int  ftruncate(int fd, long len)                { return asm_ftruncate(fd, len); }
+    inline int  unlink(const char* path)                   { return asm_unlink(path); }
+    inline long write(int fd, const void* buf, unsigned long n) { return asm_write(fd, buf, n); }
+    inline long read(int fd, void* buf, unsigned long n)   { return asm_read(fd, buf, n); }
+}
+
+#endif
