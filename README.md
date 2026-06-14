@@ -10,3 +10,5 @@
 - Claude (Ofc)
 - Gemini cli
 - Opencode
+
+### Only took a day I think
