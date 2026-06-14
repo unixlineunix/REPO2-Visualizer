@@ -56,15 +56,33 @@ bool AudioCapture::initAndStartDevice(CaptureSource source) {
         m_deviceInitialized = false;
     }
 
-    ma_device_config config = ma_device_config_init(ma_device_type_capture);
+    ma_device_config config{};
+    bool useMonitor = false;
+    ma_device_id monitorId{};
+
+#if defined(_WIN32)
+    if (source == CaptureSource::SystemAudio) {
+        config = ma_device_config_init(ma_device_type_loopback);
+        config.playback.format   = ma_format_f32;
+        config.playback.channels = 2;
+        config.sampleRate        = 48000;
+        config.dataCallback      = AudioCapture::dataCallback;
+        config.pUserData         = this;
+    } else {
+        config = ma_device_config_init(ma_device_type_capture);
+        config.capture.format   = ma_format_f32;
+        config.capture.channels = 2;
+        config.sampleRate       = 48000;
+        config.dataCallback     = AudioCapture::dataCallback;
+        config.pUserData        = this;
+    }
+#else
+    config = ma_device_config_init(ma_device_type_capture);
     config.capture.format   = ma_format_f32;
-    config.capture.channels = 2; // Stereo for XY mode
+    config.capture.channels = 2;
     config.sampleRate       = 48000;
     config.dataCallback     = AudioCapture::dataCallback;
     config.pUserData        = this;
-
-    ma_device_id monitorId{};
-    bool useMonitor = false;
 
     if (source == CaptureSource::SystemAudio) {
         ma_device_info* pCaptureInfos = nullptr;
@@ -91,6 +109,7 @@ bool AudioCapture::initAndStartDevice(CaptureSource source) {
 
         config.capture.pDeviceID = &monitorId;
     }
+#endif
 
     if (ma_device_init(&m_context, &config, &m_device) != MA_SUCCESS) {
         std::cerr << "AudioCapture: failed to initialize capture device\n";
