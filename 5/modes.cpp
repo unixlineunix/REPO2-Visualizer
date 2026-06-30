@@ -283,36 +283,47 @@ namespace modes {
 
 ModeOutput buildOscilloscope(const std::vector<float>& samples, const VisState& state) {
     ModeOutput out;
-    const std::vector<float> smoothed = smoothSignal(samples, 2);
+    const int smoothRadius = state.lineSmooth ? std::max(1, int(state.lineSharpness * 2)) : 2;
+    const std::vector<float> smoothed = smoothSignal(samples, smoothRadius);
     const size_t n = smoothed.size();
 
-    // waveZoom > 1.0 means fewer samples (zoomed in, longer wavelength)
-    // waveZoom < 1.0 means more samples (zoomed out, shorter wavelength)
-    // Here we interpret "shorter wavelength" as more cycles in the view.
-    // So waveZoom will scale the window of samples.
     size_t displayCount = static_cast<size_t>(static_cast<float>(n) / state.waveZoom);
     displayCount = std::clamp<size_t>(displayCount, 16, n);
 
-    // Add a time-based offset for "speed"
     float timeOffset = static_cast<float>(glfwGetTime()) * state.waveSpeed * static_cast<float>(n);
     long baseIdx = static_cast<long>(timeOffset) % static_cast<long>(n);
 
-    out.lineVertices.reserve(displayCount * 6);
-    for (size_t i = 0; i < displayCount; ++i) {
-        const float x = (static_cast<float>(i) / static_cast<float>(displayCount - 1)) * 2.0f - 1.0f;
-        
-        size_t sampleIdx = (static_cast<size_t>(baseIdx) + i) % n;
-        const float y = std::clamp(smoothed[sampleIdx] * 4.0f * state.sensitivity, -1.0f, 1.0f);
-
-        const float t = static_cast<float>(i) / static_cast<float>(displayCount - 1);
-        const Color3 color = resolveColor(state, Color3{0.2f, 1.0f, 1.0f}, t);
-
-        pushVertex(out.lineVertices, x, y, color.r, color.g, color.b, 1.0f);
+    if (state.lineSmooth) {
+        // Per-pixel mode: draw individual points for a smooth CRT-like trace
+        out.lineVertices.reserve(displayCount * 6);
+        for (size_t i = 0; i < displayCount; ++i) {
+            const float x = (static_cast<float>(i) / static_cast<float>(displayCount - 1)) * 2.0f - 1.0f;
+            size_t sampleIdx = (static_cast<size_t>(baseIdx) + i) % n;
+            const float y = std::clamp(smoothed[sampleIdx] * 4.0f * state.sensitivity, -1.0f, 1.0f);
+            const float t = static_cast<float>(i) / static_cast<float>(displayCount - 1);
+            const Color3 color = resolveColor(state, Color3{0.2f, 1.0f, 1.0f}, t);
+            pushVertex(out.lineVertices, x, y, color.r, color.g, color.b,
+                       std::clamp(state.lineSharpness * 2.0f, 1.0f, 12.0f));
+        }
+        out.linePrimitive = GL_POINTS;
+        out.linePoints = true;
+        out.lineSegments  = {{0, static_cast<GLsizei>(displayCount)}};
+    } else {
+        // Standard line mode: sharpness controls smoothing radius
+        out.lineVertices.reserve(displayCount * 6);
+        for (size_t i = 0; i < displayCount; ++i) {
+            const float x = (static_cast<float>(i) / static_cast<float>(displayCount - 1)) * 2.0f - 1.0f;
+            size_t sampleIdx = (static_cast<size_t>(baseIdx) + i) % n;
+            const float y = std::clamp(smoothed[sampleIdx] * 4.0f * state.sensitivity, -1.0f, 1.0f);
+            const float t = static_cast<float>(i) / static_cast<float>(displayCount - 1);
+            const Color3 color = resolveColor(state, Color3{0.2f, 1.0f, 1.0f}, t);
+            pushVertex(out.lineVertices, x, y, color.r, color.g, color.b, 1.0f);
+        }
+        out.linePrimitive = GL_LINE_STRIP;
+        out.lineSegments  = {{0, static_cast<GLsizei>(displayCount)}};
     }
 
-    out.linePrimitive = GL_LINE_STRIP;
-    out.lineSegments  = {{0, static_cast<GLsizei>(displayCount)}};
-    out.lineGlow      = true;
+    out.lineGlow = true;
     return out;
 }
 
@@ -525,8 +536,7 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
     const size_t n = std::min(left.size(), right.size());
     if (n == 0) return out;
 
-    constexpr size_t targetCount = 256;
-    const size_t count = std::min(n, targetCount);
+    const size_t count = std::min(n, state.particleCount);
     const std::vector<float> dsLeft = downsample(left, count);
     const std::vector<float> dsRight = downsample(right, count);
 
@@ -555,20 +565,53 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
             out.lineSegments = {{0, static_cast<GLsizei>(displayCount)}};
             break;
 
-        case TrueXYMode::LineStrip:
+        case TrueXYMode::LineStrip: {
             out.lineVertices.reserve(displayCount * 6);
-            for (const auto& p : pts)
+            GLsizei segStart = 0;
+            GLsizei segCount = 0;
+            auto emitSegment = [&]() {
+                if (segCount > 1) out.lineSegments.push_back({segStart, segCount});
+            };
+            for (size_t i = 0; i < displayCount; ++i) {
+                const auto& p = pts[i];
+                if (i > 0) {
+                    const float dx = p.x - pts[i-1].x, dy = p.y - pts[i-1].y;
+                    if (std::sqrt(dx*dx + dy*dy) >= 0.35f) {
+                        emitSegment();
+                        segStart += segCount;
+                        segCount = 0;
+                    }
+                }
                 pushVertex(out.lineVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, 1.0f);
+                segCount++;
+            }
+            emitSegment();
             out.linePrimitive = GL_LINE_STRIP;
-            out.lineSegments = {{0, static_cast<GLsizei>(displayCount)}};
             break;
+        }
 
-        case TrueXYMode::Both:
+        case TrueXYMode::Both: {
             out.lineVertices.reserve(displayCount * 6);
-            for (const auto& p : pts)
+            GLsizei segStart = 0;
+            GLsizei segCount = 0;
+            auto emitSegment = [&]() {
+                if (segCount > 1) out.lineSegments.push_back({segStart, segCount});
+            };
+            for (size_t i = 0; i < displayCount; ++i) {
+                const auto& p = pts[i];
+                if (i > 0) {
+                    const float dx = p.x - pts[i-1].x, dy = p.y - pts[i-1].y;
+                    if (std::sqrt(dx*dx + dy*dy) >= 0.35f) {
+                        emitSegment();
+                        segStart += segCount;
+                        segCount = 0;
+                    }
+                }
                 pushVertex(out.lineVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, 1.0f);
+                segCount++;
+            }
+            emitSegment();
             out.linePrimitive = GL_LINE_STRIP;
-            out.lineSegments = {{0, static_cast<GLsizei>(displayCount)}};
             out.fillVertices.reserve(displayCount * 6 * 6);
             for (const auto& p : pts) {
                 const float s = 0.004f;
@@ -581,6 +624,7 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
             }
             out.fillAlpha = 1.0f;
             break;
+        }
 
         case TrueXYMode::FilledTrail: {
             constexpr float hw = 0.003f;

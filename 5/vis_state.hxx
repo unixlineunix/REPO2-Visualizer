@@ -22,6 +22,7 @@ struct VisState {
 
     size_t maxBarsLimit = 200;
     float maxSensitivityLimit = 5.0f;
+    float limitMultiplier = 2.0f;
 
     float waveZoom = 1.0f;
     float waveSpeed = 0.0f;
@@ -36,6 +37,15 @@ struct VisState {
     float bloomSize = 0.3f;
 
     bool antiAliasing = false;
+    bool jumpColor = false;
+    bool jumpOnGradient = false;
+    float colorBrightness = 0.5f;
+    float jumpSensitivity = 1.0f;
+    bool diffColor = false;
+    float diffSensitivity = 1.0f;
+    bool lineSmooth = false;
+    float lineSharpness = 1.0f;
+    size_t particleCount = 256;
     InputMode inputMode = InputMode::Microphone;
     TrueXYMode trueXYMode = TrueXYMode::Scatter;
     bool trueXYLines = false;

@@ -7,7 +7,7 @@ OBJS := main.o modes.o audio.o fft.o shader.o vis_state.o glad.o
 # Windows cross-compilation with MinGW
 MINGW_CXX      := x86_64-w64-mingw32-g++
 MINGW_CXXFLAGS := -std=c++20 -I. -D_GLFW_WIN32
-MINGW_LDFLAGS  := -L/tmp/glfw-3.4 -lglfw3 -lopengl32 -lgdi32 -lwinmm -static-libgcc -static-libstdc++ -static
+MINGW_LDFLAGS  := -L/tmp/glfw_mingw_build -lglfw3 -lopengl32 -lgdi32 -lwinmm -static-libgcc -static-libstdc++ -static
 MINGW_OBJS     := main_mingw.o modes_mingw.o audio_mingw.o fft_mingw.o shader_mingw.o vis_state_mingw.o glad_mingw.o
 
 .PHONY: all clean win32

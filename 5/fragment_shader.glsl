@@ -6,6 +6,7 @@ in vec3 vColor;
 
 uniform int uIsPoint;
 uniform float uAlpha;
+uniform float uBloomIntensity;
 
 void main() {
     if (uIsPoint == 1) {
@@ -15,5 +16,6 @@ void main() {
             discard;
         }
     }
-    FragColor = vec4(vColor, uAlpha);
+    vec3 color = vColor * (1.0 + uBloomIntensity * 0.5);
+    FragColor = vec4(color, uAlpha);
 }

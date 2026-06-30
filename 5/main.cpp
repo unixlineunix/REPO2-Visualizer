@@ -9,16 +9,30 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#ifndef _WIN32
+#include <poll.h>
+#include <termios.h>
+#endif
 #include <random>
 #include <sstream>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#include <direct.h>
+#endif
 
 namespace {
 
-constexpr int WINDOW_WIDTH  = 1280;
-constexpr int WINDOW_HEIGHT = 720;
+int WINDOW_WIDTH  = 1280;
+int WINDOW_HEIGHT = 720;
 
 constexpr size_t RING_BUFFER_SIZE = 16384;
 constexpr size_t FFT_SIZE         = 4096;
@@ -504,11 +518,13 @@ void hsvToRgb(float h, float s, float v, float& r, float& g, float& b) {
     b = bb + m;
 }
 
-Color3 randomColor(std::mt19937& rng) {
+Color3 randomColor(std::mt19937& rng, float brightness = 0.5f) {
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
     float h = dist(rng);
     float s = 0.5f + 0.5f * dist(rng);
-    float v = 0.6f + 0.4f * dist(rng);
+    float vMin = 0.1f + brightness * 0.7f;
+    float vMax = std::min(1.0f, vMin + 0.4f);
+    float v = vMin + (vMax - vMin) * dist(rng);
     float r, g, b;
     hsvToRgb(h, s, v, r, g, b);
     return {r, g, b};
@@ -517,7 +533,7 @@ Color3 randomColor(std::mt19937& rng) {
 void randomizeGradient(VisState& state, std::mt19937& rng) {
     state.gradientColors.clear();
     for (size_t i = 0; i < state.gradientColorCount; ++i) {
-        state.gradientColors.push_back(randomColor(rng));
+        state.gradientColors.push_back(randomColor(rng, state.colorBrightness));
     }
 }
 
@@ -571,24 +587,245 @@ void printAnsiDoc(const char* text) {
 } // namespace
 
 int main(int argc, char* argv[]) {
-    // --- CLI flags ---
+        int startMode = -1;
+    float startSensitivity = -1.0f;
+    float startZoom = -1.0f;
+    float startWaveZoom = -1.0f;
+    float startWaveSpeed = 9999.0f;
+    size_t startBars = 0;
+    bool startBloom = false;
+    float startBloomIntensity = -1.0f;
+    bool startAntiAlias = false;
+    bool startJumpColor = false;
+    float startJumpSens = -1.0f;
+    size_t startGradColors = 0;
+    int startTrueXYMode = -1;
+    bool startTrueXYLines = false;
+    bool flagSetTrueXYLines = false;
+    bool startLighter = false;
+    bool startDarker = false;
+    bool startAnalogScope = false;
+    float startAnalogDecay = -1.0f;
+    size_t startAnalogRes = 0;
+    size_t startAnalogLines = 0;
+    bool flagSetBloom = false;
+    bool flagSetJump = false;
+    bool flagSetJumpGrad = false;
+    bool startJumpGrad = false;
+    bool flagSetAA = false;
+    size_t startParticles = 0;
+    float startBAmu = -1.0f;
+    bool startDiffColor = false;
+    bool flagSetDiff = false;
+    float startDiffSens = -1.0f;
+    bool startSystem = false;
+    bool startMic = false;
+    std::string configPath;
+    std::string configSavePath;
+    bool flagLoadConfig = false;
+    bool tuiOnly = false;
+    bool tuiEnabled = false;
+    int tuiSelection = -1;
+    int termWidth = 80, termHeight = 24;
+
+    // --- First pass: find --Config and --LoadConfig ---
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--LoadConfig") { flagLoadConfig = true; break; }
+        if (a == "--Config" && i + 1 < argc) { configPath = argv[i + 1]; break; }
+    }
+
+    auto tryBool = [&](const char* val, bool& out) -> bool {
+        std::string v(val);
+        if (v == "on" || v == "1" || v == "true") { out = true; return true; }
+        if (v == "off" || v == "0" || v == "false") { out = false; return true; }
+        return false;
+    };
+
+    // --- Config file loader ---
+    auto parseConfigFile = [&](const std::string& path) {
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            std::cerr << "Config: could not open " << path << "\n";
+            return;
+        }
+        std::cout << "Config: loading " << path << "\n";
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream iss(line);
+            std::string token;
+            if (!(iss >> token)) continue;
+            std::string val;
+            std::getline(iss >> std::ws, val);
+            const char* v = val.empty() ? nullptr : val.c_str();
+
+            // Map config tokens to start variables (same as CLI flags)
+            if (token == "--mode" && v) { startMode = std::atoi(v); }
+            else if (token == "--bars" && v) { startBars = static_cast<size_t>(std::max(0, std::atoi(v))); }
+            else if (token == "--sensitivity" && v) { startSensitivity = std::atof(v); }
+            else if (token == "--zoom" && v) { startZoom = std::atof(v); }
+            else if (token == "--wave-zoom" && v) { startWaveZoom = std::atof(v); }
+            else if (token == "--wave-speed" && v) { startWaveSpeed = std::atof(v); }
+            else if (token == "--bloom" || token == "-b") { flagSetBloom = true; if (v) tryBool(v, startBloom); else startBloom = true; }
+            else if (token == "--bloom-intensity" && v) { startBloomIntensity = std::atof(v); }
+            else if (token == "--B-amu" && v) { startBAmu = std::atof(v); }
+            else if (token == "--anti-alias") { flagSetAA = true; if (v) tryBool(v, startAntiAlias); else startAntiAlias = true; }
+            else if (token == "--lighter-color") { if (v) tryBool(v, startLighter); else startLighter = true; }
+            else if (token == "--darker-color") { if (v) tryBool(v, startDarker); else startDarker = true; }
+            else if (token == "--jump-color" || token == "-j") { flagSetJump = true; if (v) tryBool(v, startJumpColor); else startJumpColor = true; }
+            else if (token == "--jump-on-gradient" || token == "--jumpOnGradient") { flagSetJumpGrad = true; if (v) tryBool(v, startJumpGrad); else startJumpGrad = true; }
+            else if (token == "--jump-sensitivity" && v) { startJumpSens = std::atof(v); }
+            else if (token == "--diff-color") { flagSetDiff = true; if (v) tryBool(v, startDiffColor); else startDiffColor = true; }
+            else if (token == "--diff-sensitivity" && v) { startDiffSens = std::atof(v); }
+            else if (token == "--gradient-colors" && v) { startGradColors = static_cast<size_t>(std::max(0, std::atoi(v))); }
+            else if (token == "--truexy-mode" && v) { startTrueXYMode = std::atoi(v); }
+            else if (token == "--truexy-lines") { flagSetTrueXYLines = true; if (v) tryBool(v, startTrueXYLines); else startTrueXYLines = true; }
+            else if (token == "--analog-scope") { if (v) tryBool(v, startAnalogScope); else startAnalogScope = true; }
+            else if (token == "--analog-decay" && v) { startAnalogDecay = std::atof(v); }
+            else if (token == "--analog-resolution" && v) { startAnalogRes = static_cast<size_t>(std::max(64, std::atoi(v))); }
+            else if (token == "--analog-lines" && v) { startAnalogLines = static_cast<size_t>(std::max(1, std::atoi(v))); }
+            else if (token == "--particles" && v) { startParticles = static_cast<size_t>(std::max(1, std::atoi(v))); }
+            else if (token == "--width" && v) { WINDOW_WIDTH = std::max(320, std::atoi(v)); }
+            else if (token == "--height" && v) { WINDOW_HEIGHT = std::max(240, std::atoi(v)); }
+            else if (token == "--system") { if (v) tryBool(v, startSystem); else startSystem = true; }
+            else if (token == "--mic") { if (v) tryBool(v, startMic); else startMic = true; }
+            else std::cerr << "Config: unknown token '" << token << "'\n";
+        }
+        file.close();
+    };
+
+    auto defaultConfigPath = []() -> std::string {
+#ifdef _WIN32
+        const char* appdata = std::getenv("APPDATA");
+        if (appdata) return std::string(appdata) + "\\visualizer\\visualizer.config";
+        return "visualizer.config";
+#else
+        const char* home = std::getenv("HOME");
+        if (home) return std::string(home) + "/.config/visualizer/visualizer.config";
+        return "visualizer.config";
+#endif
+    };
+    auto ensureDir = [](const std::string& path) {
+        size_t slash = path.find_last_of("/\\");
+        if (slash == std::string::npos) return;
+        std::string dir = path.substr(0, slash);
+#ifdef _WIN32
+        _mkdir(dir.c_str());
+#else
+        mkdir(dir.c_str(), 0755);
+#endif
+    };
+    auto writeDefaultConfig = [](const std::string& path) {
+        std::ofstream out(path);
+        if (!out) return false;
+        out << "# Chills Visualizer default config\n";
+        out << "# Lines starting with # are ignored.\n";
+        out << "# Syntax: --flag value  (same as CLI flags, value optional for booleans)\n";
+        out << "\n";
+        out << "--mode 1\n";
+        out << "--bars 64\n";
+        out << "--sensitivity 1.0\n";
+        out << "--zoom 1.0\n";
+        out << "--wave-zoom 1.0\n";
+        out << "--wave-speed 0.0\n";
+        out << "--bloom off\n";
+        out << "--bloom-intensity 1.0\n";
+        out << "--jump-color off\n";
+        out << "--jump-sensitivity 1.0\n";
+        out << "--jump-on-gradient off\n";
+        out << "--diff-color off\n";
+        out << "--diff-sensitivity 1.0\n";
+        out << "--anti-alias off\n";
+        out << "--B-amu 2.0\n";
+        out << "--particles 256\n";
+        out << "--gradient-colors 1\n";
+        out << "--truexy-mode 0\n";
+        out << "--analog-scope off\n";
+        out << "--analog-decay 4.0\n";
+        out << "--analog-resolution 4096\n";
+        out << "--analog-lines 4096\n";
+        out << "--lighter-color off\n";
+        out << "--darker-color off\n";
+        out << "--system off\n";
+        out << "--mic off\n";
+        return true;
+    };
+    if (flagLoadConfig) {
+        std::string cfgPath = defaultConfigPath();
+        ensureDir(cfgPath);
+        if (!std::ifstream(cfgPath).good()) {
+            writeDefaultConfig(cfgPath);
+        }
+        parseConfigFile(cfgPath);
+        configSavePath = cfgPath;
+    }
+    if (!configPath.empty()) {
+        ensureDir(configPath);
+        if (!std::ifstream(configPath).good()) {
+            writeDefaultConfig(configPath);
+        }
+        parseConfigFile(configPath);
+        configSavePath = configPath;
+    }
+
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             std::cout << "\033[1mAudio Visualizer\033[0m \342\200\224 real-time audio-reactive visualizations\n"
 "\n"
-"Usage: visualizer [--help] [--summary] [--detail] [--detail-summary]\n"
+"Usage: visualizer [options]\n"
 "\n"
-"  \033[1m--help\033[0m             This message\n"
-"  \033[1m--summary\033[0m          Mode list and condensed keybinds\n"
-"  \033[1m--detail\033[0m           Full line-by-line code walkthrough\n"
-"  \033[1m--detail-summary\033[0m   Condensed technical reference\n";
+"\033[1mInfo flags:\033[0m\n"
+"  \033[1m--help, -h\033[0m             This message\n"
+"  \033[1m--summary, -s\033[0m          Mode list and condensed keybinds\n"
+"  \033[1m--detail, -d\033[0m           Full line-by-line code walkthrough\n"
+"  \033[1m--detail-summary, -ds\033[0m  Condensed technical reference\n"
+"\n"
+"\033[1mConfig flags:\033[0m\n"
+ "  \033[1m--LoadConfig\033[0m             Load config from ~/.config/visualizer/visualizer.config (Linux)\n"
+ "                       \033[1m\033[0m             or %%APPDATA%%\\visualizer\\visualizer.config (Windows)\n"
+ "  \033[1m--Config <path>\033[0m          Load config from given path\n"
+"\n"
+"\033[1mStartup flags:\033[0m\n"
+"  (boolean flags accept: on, off, true, false, 1, 0 — or omit for default-on)\n"
+"\n"
+"  \033[1m--mode, -m <0-9>\033[0m       Start visualization mode (0-9)\n"
+"  \033[1m--bars <n>\033[0m             Initial bar count\n"
+"  \033[1m--sensitivity <f>\033[0m      Audio sensitivity\n"
+"  \033[1m--zoom <f>\033[0m             Zoom level\n"
+"  \033[1m--wave-zoom <f>\033[0m        Wave/oscilloscope zoom\n"
+"  \033[1m--wave-speed <f>\033[0m       Wave scroll speed\n"
+"  \033[1m--bloom, -b [on/off]\033[0m    Enable bloom\n"
+"  \033[1m--bloom-intensity <f>\033[0m  Bloom intensity (0.5, 1.0, 1.5, 2.0, 2.5)\n"
+"  \033[1m--B-amu <f>\033[0m             B key limit multiplier (default 2.0)\n"
+"  \033[1m--anti-alias [on/off]\033[0m   Enable anti-aliasing\n"
+"  \033[1m--lighter-color [on/off]\033[0m Generate lighter/pastel random colors\n"
+"  \033[1m--darker-color [on/off]\033[0m  Generate darker random colors\n"
+"  \033[1m--jump-color, -j [on/off]\033[0m Enable jump-triggered random color\n"
+"  \033[1m--jump-on-gradient [on/off]\033[0m Jump respects current gradient/R mode\n"
+ "  \033[1m--jump-sensitivity <f>\033[0m Jump detection sensitivity (0.25-5.0)\n"
+ "  \033[1m--diff-color [on/off]\033[0m   Diff-triggered random color (spectral diff)\n"
+ "  \033[1m--diff-sensitivity <f>\033[0m  Diff detection sensitivity (0.25-5.0)\n"
+ "  \033[1m--gradient-colors <n>\033[0m  Number of gradient colors\n"
+"  \033[1m--truexy-mode <0-4>\033[0m    TrueXY sub-mode (0=Scatter..4=Phosphor)\n"
+"  \033[1m--truexy-lines [on/off]\033[0m  Enable TrueXY line overlay\n"
+"  \033[1m--analog-scope [on/off]\033[0m  Start in analog scope mode\n"
+"  \033[1m--analog-decay <f>\033[0m     Analog scope decay rate\n"
+"  \033[1m--analog-resolution <n>\033[0m Analog scope resolution\n"
+ "  \033[1m--analog-lines <n>\033[0m     Analog scope line count\n"
+ "  \033[1m--particles <n>\033[0m        Particle count for TrueXY/oscilloscope (1-4096)\n"
+"  \033[1m--width <px>\033[0m           Window width\n"
+"  \033[1m--height <px>\033[0m          Window height\n"
+"  \033[1m--system [on/off]\033[0m       Start with system audio capture\n"
+"  \033[1m--mic [on/off]\033[0m           Start with microphone capture\n"
+"\n";
             return 0;
         }
         if (arg == "--summary" || arg == "-s") {
             std::cout << "\033[1mAudio Visualizer\033[0m \342\200\224 real-time audio-reactive visualizations\n"
 "\n"
-"Usage: visualizer [--help] [--summary] [--detail] [--detail-summary]\n"
+"Usage: visualizer [options]\n"
 "\n"
 "\033[1mModes (number keys 0-9):\033[0m\n"
 "  0  TrueXY          XY Lissajous display of stereo channels\n"
@@ -605,12 +842,17 @@ int main(int argc, char* argv[]) {
 "\033[1mGlobal keys:\033[0m\n"
 "  \033[1mH\033[0m          Analog scope mode (P31 phosphor emulation)\n"
 "  \033[1mQ/W\033[0m        Sub-mode cycle (scope: Scatter/Both | XY: modes)\n"
-"  \033[1mE/I/O/J\033[0m    TrueXY sub-modes (Both/Filled/Glow/Phosphor)\n"
+"  \033[1mE/I/O\033[0m      TrueXY sub-modes (Both/Filled/Glow)\n"
+ "  \033[1mJ\033[0m          Toggle jump-triggered random color (peak onset)\n"
+ "  \033[1mD\033[0m          Toggle diff-triggered random color (spectral difference)\n"
+ "  \033[1m/ \\\033[0m        Jump sensitivity up/down (when J active)\n"
+ "  \033[1mU/Y\033[0m        Diff sensitivity up/down (when D active)\n"
 "  \033[1mR\033[0m          Random solid color\n"
 "  \033[1mG\033[0m          Random gradient color\n"
 "  \033[1mP\033[0m          Cycle decay (scope) / toggle lines (XY)\n"
-"  \033[1mS\033[0m          Toggle anti-aliasing\n"
-"  \033[1mA/B/L\033[0m      Toggle bloom\n"
+ "  \033[1mA\033[0m          Toggle anti-aliasing\n"
+ "  \033[1mL\033[0m          Toggle bloom\n"
+ "  \033[1mT\033[0m          Toggle TUI overlay\n"
 "  \033[1mM\033[0m          Toggle mic/system input\n"
 "  \033[1m,/. \033[0m        Gradient color count\n"
 "  \033[1mShift+,/.\033[0m  Wave scroll speed\n"
@@ -620,6 +862,14 @@ int main(int argc, char* argv[]) {
 "  \033[1m\342\206\220/\342\206\222\033[0m        Bars count / wave zoom\n"
 "  \033[1mShift+\342\206\220/\342\206\222\033[0m  Wave scroll speed\n"
 "  \033[1mESC\033[0m        Quit\n"
+"\n"
+"\033[1mStartup flags (--help for full list, boolean flags accept on/off):\033[0m\n"
+"  \033[1m--mode, -m <0-9>\033[0m       --bars <n>       \033[1m--sensitivity <f>\033[0m\n"
+"  \033[1m--zoom <f>\033[0m             --wave-zoom <f>  \033[1m--wave-speed <f>\033[0m\n"
+ "  \033[1m--bloom, -b\033[0m             --jump-color, -j \033[1m--diff-color\033[0m     \033[1m--jump-on-gradient\033[0m\n"
+ "  \033[1m--particles <n>\033[0m         --system\033[0m               --lighter-color  \033[1m--darker-color\033[0m\n"
+ "  \033[1m--LoadConfig\033[0m            Config:  ~/.config/visualizer/visualizer.config (Linux)\n"
+ "                       \033[1m\033[0m              or  %%APPDATA%%\\visualizer\\visualizer.config (Windows)\n"
 "\n";
             return 0;
         }
@@ -2356,7 +2606,478 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             printAnsiDoc(kDetailText);
             return 0;
         }
+
+        // --- Startup config flags ---
+        if (arg == "--mode" || arg == "-m") {
+            if (++i >= argc) { std::cerr << "--mode requires 0-9\n"; return 1; }
+            startMode = std::atoi(argv[i]);
+            if (startMode < 0 || startMode > 9) { std::cerr << "--mode must be 0-9\n"; return 1; }
+            continue;
+        }
+        if (arg == "--bars") {
+            if (++i >= argc) { std::cerr << "--bars requires a number\n"; return 1; }
+            startBars = static_cast<size_t>(std::max(0, std::atoi(argv[i])));
+            continue;
+        }
+        if (arg == "--sensitivity") {
+            if (++i >= argc) { std::cerr << "--sensitivity requires a number\n"; return 1; }
+            startSensitivity = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--zoom") {
+            if (++i >= argc) { std::cerr << "--zoom requires a number\n"; return 1; }
+            startZoom = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--width") {
+            if (++i >= argc) { std::cerr << "--width requires a number\n"; return 1; }
+            WINDOW_WIDTH = std::max(320, std::atoi(argv[i]));
+            continue;
+        }
+        if (arg == "--height") {
+            if (++i >= argc) { std::cerr << "--height requires a number\n"; return 1; }
+            WINDOW_HEIGHT = std::max(240, std::atoi(argv[i]));
+            continue;
+        }
+        if (arg == "--bloom" || arg == "-b") {
+            flagSetBloom = true;
+            startBloom = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startBloom)) { ++i; }
+            continue;
+        }
+        if (arg == "--jump-color" || arg == "-j") {
+            flagSetJump = true;
+            startJumpColor = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startJumpColor)) { ++i; }
+            continue;
+        }
+        if (arg == "--system") {
+            startSystem = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startSystem)) { ++i; }
+            continue;
+        }
+        if (arg == "--mic") {
+            startMic = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startMic)) { ++i; }
+            continue;
+        }
+        if (arg == "--wave-zoom") {
+            if (++i >= argc) { std::cerr << "--wave-zoom requires a number\n"; return 1; }
+            startWaveZoom = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--wave-speed") {
+            if (++i >= argc) { std::cerr << "--wave-speed requires a number\n"; return 1; }
+            startWaveSpeed = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--bloom-intensity") {
+            if (++i >= argc) { std::cerr << "--bloom-intensity requires a number\n"; return 1; }
+            startBloomIntensity = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--anti-alias") {
+            flagSetAA = true;
+            startAntiAlias = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startAntiAlias)) { ++i; }
+            continue;
+        }
+        if (arg == "--jump-sensitivity") {
+            if (++i >= argc) { std::cerr << "--jump-sensitivity requires a number\n"; return 1; }
+            startJumpSens = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--diff-color") {
+            flagSetDiff = true;
+            startDiffColor = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startDiffColor)) { ++i; }
+            continue;
+        }
+        if (arg == "--diff-sensitivity") {
+            if (++i >= argc) { std::cerr << "--diff-sensitivity requires a number\n"; return 1; }
+            startDiffSens = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--gradient-colors") {
+            if (++i >= argc) { std::cerr << "--gradient-colors requires a number\n"; return 1; }
+            startGradColors = static_cast<size_t>(std::max(0, std::atoi(argv[i])));
+            continue;
+        }
+        if (arg == "--truexy-mode") {
+            if (++i >= argc) { std::cerr << "--truexy-mode requires 0-4\n"; return 1; }
+            startTrueXYMode = std::atoi(argv[i]);
+            if (startTrueXYMode < 0 || startTrueXYMode > 4) { std::cerr << "--truexy-mode must be 0-4\n"; return 1; }
+            continue;
+        }
+        if (arg == "--truexy-lines") {
+            flagSetTrueXYLines = true;
+            startTrueXYLines = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startTrueXYLines)) { ++i; }
+            continue;
+        }
+        if (arg == "--lighter-color") {
+            startLighter = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startLighter)) { ++i; }
+            continue;
+        }
+        if (arg == "--darker-color") {
+            startDarker = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startDarker)) { ++i; }
+            continue;
+        }
+        if (arg == "--analog-scope") {
+            startAnalogScope = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startAnalogScope)) { ++i; }
+            continue;
+        }
+        if (arg == "--jump-on-gradient" || arg == "--jumpOnGradient") {
+            flagSetJumpGrad = true;
+            startJumpGrad = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startJumpGrad)) { ++i; }
+            continue;
+        }
+        if (arg == "--analog-decay") {
+            if (++i >= argc) { std::cerr << "--analog-decay requires a number\n"; return 1; }
+            startAnalogDecay = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--analog-resolution") {
+            if (++i >= argc) { std::cerr << "--analog-resolution requires a number\n"; return 1; }
+            startAnalogRes = static_cast<size_t>(std::max(64, std::atoi(argv[i])));
+            continue;
+        }
+        if (arg == "--analog-lines") {
+            if (++i >= argc) { std::cerr << "--analog-lines requires a number\n"; return 1; }
+            startAnalogLines = static_cast<size_t>(std::max(1, std::atoi(argv[i])));
+            continue;
+        }
+        if (arg == "--particles") {
+            if (++i >= argc) { std::cerr << "--particles requires a number\n"; return 1; }
+            startParticles = static_cast<size_t>(std::max(1, std::atoi(argv[i])));
+            continue;
+        }
+        if (arg == "--B-amu") {
+            if (++i >= argc) { std::cerr << "--B-amu requires a number\n"; return 1; }
+            startBAmu = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--LoadConfig") { continue; }
+        if (arg == "--Config") { ++i; continue; }
+        if (arg == "--tui" || arg == "--tui-only") { tuiOnly = true; continue; }
     }
+
+    // ── TUI-only config editor mode (no graphics) ──
+    if (tuiOnly) {
+        std::string cfgPath = configSavePath.empty() ? defaultConfigPath() : configSavePath;
+        ensureDir(cfgPath);
+        if (!std::ifstream(cfgPath).good()) writeDefaultConfig(cfgPath);
+        VisState tuiState;
+        VisMode tuiMode = VisMode::Oscilloscope;
+        int tuiSel = -1;
+        int tw = 80, th = 24;
+#ifndef _WIN32
+        struct winsize ws;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) { tw = ws.ws_col; th = ws.ws_row; }
+#endif
+        auto tuiReload = [&]() {
+            std::ifstream f(cfgPath);
+            if (!f) return;
+            std::string line;
+            while (std::getline(f, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream iss(line);
+                std::string tok, val;
+                if (!(iss >> tok)) continue;
+                std::getline(iss >> std::ws, val);
+                const char* v = val.empty() ? nullptr : val.c_str();
+                if (tok == "--mode" && v) tuiMode = static_cast<VisMode>(std::max(0, std::min(9, std::atoi(v))));
+                else if (tok == "--bars" && v) tuiState.numBars = static_cast<size_t>(std::max(4, std::atoi(v)));
+                else if (tok == "--sensitivity" && v) tuiState.sensitivity = std::atof(v);
+                else if (tok == "--zoom" && v) tuiState.zoom = std::atof(v);
+                else if (tok == "--wave-zoom" && v) tuiState.waveZoom = std::atof(v);
+                else if (tok == "--wave-speed" && v) tuiState.waveSpeed = std::atof(v);
+                else if (tok == "--bloom" && v) tuiState.bloom = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--bloom-intensity" && v) tuiState.bloomIntensity = std::atof(v);
+                else if (tok == "--B-amu" && v) tuiState.limitMultiplier = std::atof(v);
+                else if (tok == "--anti-alias" && v) tuiState.antiAliasing = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--jump-color" && v) tuiState.jumpColor = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--jump-on-gradient" && v) tuiState.jumpOnGradient = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--jump-sensitivity" && v) tuiState.jumpSensitivity = std::atof(v);
+                else if (tok == "--diff-color" && v) tuiState.diffColor = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--diff-sensitivity" && v) tuiState.diffSensitivity = std::atof(v);
+                else if (tok == "--gradient-colors" && v) tuiState.gradientColorCount = static_cast<size_t>(std::max(1, std::atoi(v)));
+                else if (tok == "--truexy-mode" && v) tuiState.trueXYMode = static_cast<TrueXYMode>(std::max(0, std::min(5, std::atoi(v))));
+                else if (tok == "--analog-scope" && v) tuiState.analogScope = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--particles" && v) tuiState.particleCount = static_cast<size_t>(std::max(1, std::atoi(v)));
+            }
+        };
+        auto tuiSave = [&]() {
+            std::ofstream out(cfgPath);
+            if (!out) return;
+            auto b = [](bool v) { return v ? "on" : "off"; };
+            out << "# Chills Visualizer config\n";
+            out << "--mode " << static_cast<int>(tuiMode) << "\n";
+            out << "--bars " << tuiState.numBars << "\n";
+            out << "--sensitivity " << tuiState.sensitivity << "\n";
+            out << "--zoom " << tuiState.zoom << "\n";
+            out << "--wave-zoom " << tuiState.waveZoom << "\n";
+            out << "--wave-speed " << tuiState.waveSpeed << "\n";
+            out << "--bloom " << b(tuiState.bloom) << "\n";
+            out << "--bloom-intensity " << tuiState.bloomIntensity << "\n";
+            out << "--B-amu " << tuiState.limitMultiplier << "\n";
+            out << "--anti-alias " << b(tuiState.antiAliasing) << "\n";
+            out << "--jump-color " << b(tuiState.jumpColor) << "\n";
+            out << "--jump-on-gradient " << b(tuiState.jumpOnGradient) << "\n";
+            out << "--jump-sensitivity " << tuiState.jumpSensitivity << "\n";
+            out << "--diff-color " << b(tuiState.diffColor) << "\n";
+            out << "--diff-sensitivity " << tuiState.diffSensitivity << "\n";
+            out << "--gradient-colors " << tuiState.gradientColorCount << "\n";
+            out << "--truexy-mode " << static_cast<int>(tuiState.trueXYMode) << "\n";
+            out << "--analog-scope " << b(tuiState.analogScope) << "\n";
+            out << "--particles " << tuiState.particleCount << "\n";
+            out << std::flush;
+        };
+        tuiReload();
+        // Enter alt screen + hide cursor + enable mouse
+        std::cout << "\033[?1047h\033[2J\033[H\033[?25l\033[?1000h\033[?1006h\033[0m";
+        bool tuiRunning = true;
+        double lastFrameTime = 0.0;
+        while (tuiRunning) {
+            double now = 0.0;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            now = static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+#ifndef _WIN32
+            // Terminal resize check
+            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) { tw = ws.ws_col; th = ws.ws_row; }
+#endif
+            if (tw < 60 || th < 12) {
+                std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l"
+                    "\033[1;31mTerminal too small\033[0m\n";
+                break;
+            }
+            // Stdin polling for mouse
+#ifndef _WIN32
+            {
+                struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+                while (poll(&pfd, 1, 0) > 0) {
+                    char buf[32];
+                    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf) - 1);
+                    if (n <= 0) break;
+                    buf[n] = 0;
+                    char* p = buf;
+                    while (p && *p) {
+                        if (p[0] == '\033' && p[1] == '[') {
+                            int btn = 0, cx = 0, cy = 0;
+                            char endc = 0;
+                            if (sscanf(p + 2, "%d;%d;%d%c", &btn, &cx, &cy, &endc) >= 3) {
+                                int paramIdx = cy - 2;
+                                if (btn == 0 && (endc == 'M' || endc == 'm')) {
+                                    if (paramIdx >= 0 && paramIdx <= 15 && endc == 'M')
+                                        tuiSel = (tuiSel == paramIdx) ? -1 : paramIdx;
+                                } else if (btn == 64 || btn == 65) {
+                                    int delta = (btn == 64) ? 1 : -1;
+                                    if (tuiSel >= 0) {
+                                        auto a = [&](float& v, float s, float mn, float mx) { v = std::clamp(v + static_cast<float>(delta) * s, mn, mx); };
+                                        switch (tuiSel) {
+                                            case 1: tuiState.numBars = static_cast<size_t>(std::clamp(static_cast<int>(tuiState.numBars) + delta * 4, 4, 512)); break;
+                                            case 2: a(tuiState.sensitivity, 0.1f, 0.1f, 10.0f); break;
+                                            case 3: a(tuiState.zoom, 0.1f, 0.3f, 5.0f); break;
+                                            case 4: a(tuiState.waveZoom, 0.1f, 0.1f, 10.0f); break;
+                                            case 5: a(tuiState.waveSpeed, 0.1f, 0.0f, 20.0f); break;
+                                            case 6: a(tuiState.bloomIntensity, 0.5f, 0.5f, 2.5f); break;
+                                            case 8: a(tuiState.jumpSensitivity, 0.25f, 0.25f, 5.0f); break;
+                                            case 10: a(tuiState.diffSensitivity, 0.25f, 0.25f, 5.0f); break;
+                                            case 11: a(tuiState.limitMultiplier, 0.5f, 0.5f, 10.0f); break;
+                                            case 13: tuiState.gradientColorCount = static_cast<size_t>(std::clamp(static_cast<int>(tuiState.gradientColorCount) + delta, 1, 64)); break;
+                                            case 15: a(tuiState.lineSharpness, 0.25f, 0.25f, 5.0f); break;
+                                        }
+                                        tuiSave();
+                                    }
+                                }
+                            }
+                            p = strchr(p + 2, '\033');
+                        } else p++;
+                    }
+                }
+            }
+#endif
+            // Keyboard input (raw mode)
+#ifndef _WIN32
+            {
+                struct termios oldt, newt;
+                tcgetattr(STDIN_FILENO, &oldt);
+                newt = oldt;
+                newt.c_lflag &= ~(ICANON | ECHO);
+                newt.c_cc[VMIN] = 0;
+                newt.c_cc[VTIME] = 0;
+                tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+                char k = 0;
+                if (read(STDIN_FILENO, &k, 1) == 1) {
+                    if (k == '\033') {
+                        char seq[4] = {};
+                        if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
+                            if (seq[0] == '[') {
+                                switch (seq[1]) {
+                                    case 'A': tuiSel = std::max(-1, tuiSel - 1); break;
+                                    case 'B': tuiSel = std::min(15, tuiSel + 1); break;
+                                    case 'C': // right
+                                        if (tuiSel >= 0) {
+                                            switch (tuiSel) {
+                                                case 1: tuiState.numBars = std::min<size_t>(512, tuiState.numBars + 4); break;
+                                                case 2: tuiState.sensitivity = std::min(10.0f, tuiState.sensitivity + 0.1f); break;
+                                                case 3: tuiState.zoom = std::min(5.0f, tuiState.zoom + 0.1f); break;
+                                                case 4: tuiState.waveZoom = std::min(10.0f, tuiState.waveZoom + 0.1f); break;
+                                                case 5: tuiState.waveSpeed = std::min(20.0f, tuiState.waveSpeed + 0.1f); break;
+                                                case 6: tuiState.bloomIntensity = std::min(2.5f, tuiState.bloomIntensity + 0.5f); break;
+                                                case 8: tuiState.jumpSensitivity = std::min(5.0f, tuiState.jumpSensitivity + 0.25f); break;
+                                                case 10: tuiState.diffSensitivity = std::min(5.0f, tuiState.diffSensitivity + 0.25f); break;
+                                                case 11: tuiState.limitMultiplier = std::min(10.0f, tuiState.limitMultiplier + 0.5f); break;
+                                                case 13: tuiState.gradientColorCount = std::min<size_t>(64, tuiState.gradientColorCount + 1); break;
+                                                case 15: tuiState.lineSharpness = std::min(5.0f, tuiState.lineSharpness + 0.25f); break;
+                                            }
+                                            tuiSave();
+                                        }
+                                        break;
+                                    case 'D': // left
+                                        if (tuiSel >= 0) {
+                                            switch (tuiSel) {
+                                                case 1: tuiState.numBars = std::max<size_t>(4, tuiState.numBars - 4); break;
+                                                case 2: tuiState.sensitivity = std::max(0.1f, tuiState.sensitivity - 0.1f); break;
+                                                case 3: tuiState.zoom = std::max(0.3f, tuiState.zoom - 0.1f); break;
+                                                case 4: tuiState.waveZoom = std::max(0.1f, tuiState.waveZoom - 0.1f); break;
+                                                case 5: tuiState.waveSpeed = std::max(0.0f, tuiState.waveSpeed - 0.1f); break;
+                                                case 6: tuiState.bloomIntensity = std::max(0.5f, tuiState.bloomIntensity - 0.5f); break;
+                                                case 8: tuiState.jumpSensitivity = std::max(0.25f, tuiState.jumpSensitivity - 0.25f); break;
+                                                case 10: tuiState.diffSensitivity = std::max(0.25f, tuiState.diffSensitivity - 0.25f); break;
+                                                case 11: tuiState.limitMultiplier = std::max(0.5f, tuiState.limitMultiplier - 0.5f); break;
+                                                case 13: tuiState.gradientColorCount = std::max<size_t>(1, tuiState.gradientColorCount - 1); break;
+                                                case 15: tuiState.lineSharpness = std::max(0.25f, tuiState.lineSharpness - 0.25f); break;
+                                            }
+                                            tuiSave();
+                                        }
+                                        break;
+                                }
+                            }
+                        }
+                    } else if (k == '\n' || k == '\r') {
+                        if (tuiSel >= 0) {
+                            switch (tuiSel) {
+                                case 0: tuiMode = static_cast<VisMode>((static_cast<int>(tuiMode) + 1) % 10); break;
+                                case 6: tuiState.bloom = !tuiState.bloom; break;
+                                case 7: tuiState.antiAliasing = !tuiState.antiAliasing; break;
+                                case 8: tuiState.jumpColor = !tuiState.jumpColor; break;
+                                case 9: tuiState.jumpOnGradient = !tuiState.jumpOnGradient; break;
+                                case 10: tuiState.diffColor = !tuiState.diffColor; break;
+                                case 12: tuiState.trueXYMode = static_cast<TrueXYMode>((static_cast<int>(tuiState.trueXYMode) + 1) % 6); break;
+                                case 14: tuiState.analogScope = !tuiState.analogScope; break;
+                                case 15: tuiState.lineSmooth = !tuiState.lineSmooth; break;
+                            }
+                            tuiSave();
+                        }
+                    } else if (k == 'q' || k == 27 /* Esc */) {
+                        tuiRunning = false;
+                    }
+                }
+                tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            }
+#endif
+            // Render TUI (throttled to ~5 FPS)
+            if (now - lastFrameTime >= 0.2) {
+                lastFrameTime = now;
+                int hh = static_cast<int>(now) / 3600;
+                int mm = (static_cast<int>(now) % 3600) / 60;
+                int ss = static_cast<int>(now) % 60;
+                auto tag = [](bool v) { return v ? "\033[32m\xe2\x97\x8f\033[0m" : "\033[90m\xe2\x97\x8b\033[0m"; };
+                auto xym = [](TrueXYMode m) {
+                    switch (m) { case TrueXYMode::Scatter: return "Scat"; case TrueXYMode::LineStrip: return "Line";
+                    case TrueXYMode::Both: return "Both"; case TrueXYMode::FilledTrail: return "Fill";
+                    case TrueXYMode::GlowScatter: return "Glow"; case TrueXYMode::PhosphorTrail: return "Phos"; } return "?";
+                };
+                auto cm = [](ColorMode m) {
+                    switch (m) { case ColorMode::Normal: return "Nrm"; case ColorMode::RandomSolid: return "Sol";
+                    case ColorMode::RandomGradient: return "Grd"; } return "?";
+                };
+                auto mn = [](VisMode m) {
+                    switch (m) { case VisMode::TrueXY: return "XY"; case VisMode::Oscilloscope: return "Osc";
+                    case VisMode::SpectrumBars: return "Bar"; case VisMode::MirroredWaveform: return "Mir";
+                    case VisMode::CircularOscilloscope: return "COs"; case VisMode::CircularSpectrum: return "CSp";
+                    case VisMode::Lissajous: return "Lis"; case VisMode::DenseSpectrum: return "Den";
+                    case VisMode::CircularSpectrumFilled: return "CFi"; case VisMode::PulseRings: return "Pls"; } return "?";
+                };
+                std::cout << "\033[1;1H";
+                // Title bar
+                std::cout << "\033[1;36m\xe2\x95\x8e\xe2\x95\x90\xe2\x95\x90"
+                    " \033[1;37mChills Config\033[1;36m \xe2\x95\x90"
+                    << " " << mn(tuiMode) << " [" << int(tuiMode) << "]"
+                    << " \xe2\x95\x90 " << (hh < 10 ? "0" : "") << hh << ":"
+                    << (mm < 10 ? "0" : "") << mm << ":" << (ss < 10 ? "0" : "") << ss
+                    << " \xe2\x95\x90 Config Editor\033[1;36m";
+                for (int i = 0; i < tw - 47; ++i) std::cout << "\xe2\x95\x90";
+                std::cout << "\xe2\x95\x8f\033[0m\n";
+                // Params
+                auto pRow = [&](int idx, const char* label, const std::string& val, bool sel) {
+                    if (sel) std::cout << "\033[48;5;236m";
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m"
+                              << (sel ? "\033[48;5;236m\033[1;97m" : "\033[1m") << label;
+                    if (sel) std::cout << "\033[48;5;236m\033[0m\033[48;5;236m";
+                    else std::cout << "\033[0m";
+                    std::cout << " " << val;
+                    int used = 3 + static_cast<int>(strlen(label)) + 1 + static_cast<int>(val.size());
+                    if (sel) std::cout << "\033[48;5;236m";
+                    for (int i = used; i < tw - 3; ++i) std::cout << " ";
+                    if (sel) std::cout << "\033[0m";
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
+                };
+                auto rv = [&](int i, const char* l, const std::string& v) { pRow(i, l, v, tuiSel == i); };
+                rv(0,  "Mode",     std::to_string(int(tuiMode)) + " " + mn(tuiMode));
+                rv(1,  "Bars",     std::to_string(tuiState.numBars));
+                rv(2,  "Sens",     std::to_string(tuiState.sensitivity));
+                rv(3,  "Zoom",     std::to_string(tuiState.zoom));
+                rv(4,  "WZoom",    std::to_string(tuiState.waveZoom));
+                rv(5,  "WSpeed",   std::to_string(tuiState.waveSpeed));
+                rv(6,  "Bloom",    std::string(tag(tuiState.bloom)) + "  Int " + std::to_string(tuiState.bloomIntensity));
+                rv(7,  "AA",       std::string(tag(tuiState.antiAliasing)));
+                rv(8,  "Jump",     std::string(tag(tuiState.jumpColor)) + "  Sens " + std::to_string(tuiState.jumpSensitivity));
+                rv(9,  "JGrad",    std::string(tag(tuiState.jumpOnGradient)));
+                rv(10, "Diff",     std::string(tag(tuiState.diffColor)) + "  Sens " + std::to_string(tuiState.diffSensitivity));
+                rv(11, "B-AMU",    std::to_string(tuiState.limitMultiplier));
+                rv(12, "TrueXY",   xym(tuiState.trueXYMode));
+                rv(13, "Grad",     std::to_string(tuiState.gradientColorCount) + " " + cm(tuiState.colorMode));
+                rv(14, "AScope",   std::string(tag(tuiState.analogScope)));
+                rv(15, "Smooth",   std::string(tag(tuiState.lineSmooth)) + "  Sharp " + std::to_string(tuiState.lineSharpness));
+                int usedRows = 17;
+                // Bottom border
+                if (usedRows < th) {
+                    std::cout << "\033[1;36m\xe2\x95\x9a";
+                    for (int i = 0; i < std::min(tw - 2, tw - 2); ++i) std::cout << "\xe2\x95\x90";
+                    std::cout << "\xe2\x95\x9d\033[0m\n";
+                }
+                // Keybinds hint
+                if (usedRows + 2 < th) {
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m \033[90m\xe2\x86\x91\xe2\x86\x93\xe2\x86\x90\xe2\x86\x92/Enter Nav"
+                        "  Esc/T/Quit  Scroll Adj\033[0m";
+                    int klen = 56;
+                    for (int i = klen; i < tw - 3; ++i) std::cout << " ";
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
+                }
+                if (usedRows + 3 < th) {
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m \033[90mConfig: " << cfgPath << "\033[0m";
+                    int klen = 10 + static_cast<int>(cfgPath.size());
+                    for (int i = klen; i < tw - 3; ++i) std::cout << " ";
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
+                }
+                std::cout << "\033[J";
+                std::cout.flush();
+            }
+            // ~60 Hz sleep
+            struct timespec sleep_ts = { 0, 16000000 };
+            nanosleep(&sleep_ts, nullptr);
+        }
+        std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l\n";
+        return 0;
+    }
+
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW\n";
         return -1;
@@ -2445,7 +3166,88 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     std::array<bool, GLFW_KEY_LAST + 1> prevKeys{};
 
     VisMode mode = VisMode::Oscilloscope;
+
+    if (startMode >= 0)           mode = static_cast<VisMode>(startMode);
+    if (startBars > 0)            state.numBars = std::min(startBars, state.maxBarsLimit);
+    if (startSensitivity > 0.0f)  state.sensitivity = startSensitivity;
+    if (startZoom > 0.0f)         state.zoom = startZoom;
+    if (startWaveZoom > 0.0f)     state.waveZoom = startWaveZoom;
+    if (startWaveSpeed < 9990.0f) state.waveSpeed = startWaveSpeed;
+    if (flagSetBloom)             state.bloom = startBloom;
+    if (startBloomIntensity > 0.0f) state.bloomIntensity = startBloomIntensity;
+    if (flagSetAA)                state.antiAliasing = startAntiAlias;
+    if (flagSetJump)              state.jumpColor = startJumpColor;
+    if (startJumpSens > 0.0f)     state.jumpSensitivity = startJumpSens;
+    if (flagSetDiff)              state.diffColor = startDiffColor;
+    if (startDiffSens > 0.0f)     state.diffSensitivity = startDiffSens;
+    if (startGradColors > 0)      state.gradientColorCount = std::min(startGradColors, size_t(64));
+    if (startTrueXYMode >= 0)     state.trueXYMode = static_cast<TrueXYMode>(startTrueXYMode);
+    if (flagSetTrueXYLines)       state.trueXYLines = startTrueXYLines;
+    if (startLighter)             state.colorBrightness = 1.0f;
+    if (startDarker)              state.colorBrightness = 0.0f;
+    if (flagSetJumpGrad)          state.jumpOnGradient = startJumpGrad;
+    if (startAnalogScope)         state.analogScope = true;
+    if (startAnalogDecay > 0.0f)  state.analogScopeDecay = startAnalogDecay;
+    if (startAnalogRes > 0)       state.analogResolution = startAnalogRes;
+    if (startAnalogLines > 0)     state.analogLineCount = startAnalogLines;
+    if (startParticles > 0)       state.particleCount = startParticles;
+    if (startBAmu > 0.0f)         state.limitMultiplier = startBAmu;
+
+    auto saveConfigFile = [&](const std::string& path) {
+        std::ofstream out(path);
+        if (!out) return;
+        auto b = [](bool v) { return v ? "on" : "off"; };
+        out << "# Chills Visualizer config\n";
+        out << "--mode " << static_cast<int>(mode) << "\n";
+        out << "--bars " << state.numBars << "\n";
+        out << "--sensitivity " << state.sensitivity << "\n";
+        out << "--zoom " << state.zoom << "\n";
+        out << "--wave-zoom " << state.waveZoom << "\n";
+        out << "--wave-speed " << state.waveSpeed << "\n";
+        out << "--bloom " << b(state.bloom) << "\n";
+        out << "--bloom-intensity " << state.bloomIntensity << "\n";
+        out << "--B-amu " << state.limitMultiplier << "\n";
+        out << "--anti-alias " << b(state.antiAliasing) << "\n";
+        out << "--jump-color " << b(state.jumpColor) << "\n";
+        out << "--jump-on-gradient " << b(state.jumpOnGradient) << "\n";
+        out << "--jump-sensitivity " << state.jumpSensitivity << "\n";
+        out << "--diff-color " << b(state.diffColor) << "\n";
+        out << "--diff-sensitivity " << state.diffSensitivity << "\n";
+        out << "--gradient-colors " << state.gradientColorCount << "\n";
+        out << "--truexy-mode " << static_cast<int>(state.trueXYMode) << "\n";
+        out << "--analog-scope " << b(state.analogScope) << "\n";
+        out << "--particles " << state.particleCount << "\n";
+        out << std::flush;
+    };
+    if (startSystem && audio.currentSource() != CaptureSource::SystemAudio)
+        audio.switchSource(CaptureSource::SystemAudio);
+    if (startMic && audio.currentSource() != CaptureSource::Microphone)
+        audio.switchSource(CaptureSource::Microphone);
+
     std::cout << "Mode: " << modeName(mode) << "\n";
+
+    // Auto-show TUI on startup
+    tuiEnabled = true;
+    tuiSelection = -1;
+    {
+#ifndef _WIN32
+        struct winsize ws;
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+            termWidth = ws.ws_col;
+            termHeight = ws.ws_row;
+        }
+#endif
+        if (termWidth < 60 || termHeight < 12) {
+            std::cout << "Terminal too small (" << termWidth << "x" << termHeight
+                      << ") for TUI, min 60x12\n";
+            tuiEnabled = false;
+        } else {
+            std::cout << "\033[?1047h\033[2J\033[H";
+            std::cout << "\033[?25l";
+            std::cout << "\033[?1000h\033[?1006h";
+            std::cout << "\033[0m";
+        }
+    }
 
     std::vector<float> sampleBuffer(FFT_SIZE);
     std::vector<float> leftBuffer(FFT_SIZE), rightBuffer(FFT_SIZE);
@@ -2456,6 +3258,14 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     std::vector<float> denseHeights;
     std::vector<float> circularFilledHeights;
     std::vector<float> pulseBands(3, 0.0f);
+    float jumpBg = 0.0f;
+    float jumpCooldown = 0.0f;
+    float jumpLastPeak = 0.0f;
+    std::vector<float> diffRefMag;
+    bool diffRefInit = false;
+    float diffBg = 0.0f;
+    float diffCooldown = 0.0f;
+    float diffLastPeak = 0.0f;
     resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights);
 
     constexpr float kBloomIntensityLevels[] = {0.5f, 1.0f, 1.5f, 2.0f, 2.5f};
@@ -2536,9 +3346,10 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
 
         // --- Break Limits (B) ---
         if (keyEdge(window, GLFW_KEY_B, prevKeys)) {
-            state.maxBarsLimit = std::min<size_t>(MAX_BARS, state.maxBarsLimit * 2);
-            state.maxSensitivityLimit *= 2.0f;
-            std::cout << "--- LIMITS DOUBLED ---\n";
+            float m = state.limitMultiplier;
+            state.maxBarsLimit = std::min<size_t>(MAX_BARS, static_cast<size_t>(state.maxBarsLimit * m));
+            state.maxSensitivityLimit *= m;
+            std::cout << "--- LIMITS MULTIPLIED x" << m << " ---\n";
             std::cout << "Max Bars: " << state.maxBarsLimit << "\n";
             std::cout << "Max Sensitivity: " << state.maxSensitivityLimit << "\n";
         }
@@ -2562,7 +3373,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         // --- Color modes ---
         if (keyEdge(window, GLFW_KEY_R, prevKeys)) {
             state.colorMode = ColorMode::RandomSolid;
-            state.randomSolid = randomColor(rng);
+            state.randomSolid = randomColor(rng, state.colorBrightness);
         }
         if (keyEdge(window, GLFW_KEY_G, prevKeys)) {
             state.colorMode = ColorMode::RandomGradient;
@@ -2677,9 +3488,29 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             state.trueXYMode = TrueXYMode::GlowScatter;
             std::cout << "TrueXY: Glow Scatter\n";
         }
-        if (keyEdge(window, GLFW_KEY_J, prevKeys) && !state.analogScope) {
-            state.trueXYMode = TrueXYMode::PhosphorTrail;
-            std::cout << "TrueXY: Phosphor Trail\n";
+        if (keyEdge(window, GLFW_KEY_J, prevKeys)) {
+            state.jumpColor = !state.jumpColor;
+            std::cout << "Jump color: " << (state.jumpColor ? "on" : "off") << "\n";
+        }
+        if (keyEdge(window, GLFW_KEY_D, prevKeys)) {
+            state.diffColor = !state.diffColor;
+            std::cout << "Diff color: " << (state.diffColor ? "on" : "off") << "\n";
+        }
+        if (keyEdge(window, GLFW_KEY_SLASH, prevKeys) && state.jumpColor) {
+            state.jumpSensitivity = std::min(5.0f, state.jumpSensitivity + 0.25f);
+            std::cout << "Jump sensitivity: " << state.jumpSensitivity << "\n";
+        }
+        if (keyEdge(window, GLFW_KEY_BACKSLASH, prevKeys) && state.jumpColor) {
+            state.jumpSensitivity = std::max(0.25f, state.jumpSensitivity - 0.25f);
+            std::cout << "Jump sensitivity: " << state.jumpSensitivity << "\n";
+        }
+        if (keyEdge(window, GLFW_KEY_U, prevKeys) && state.diffColor) {
+            state.diffSensitivity = std::min(5.0f, state.diffSensitivity + 0.25f);
+            std::cout << "Diff sensitivity: " << state.diffSensitivity << "\n";
+        }
+        if (keyEdge(window, GLFW_KEY_Y, prevKeys) && state.diffColor) {
+            state.diffSensitivity = std::max(0.25f, state.diffSensitivity - 0.25f);
+            std::cout << "Diff sensitivity: " << state.diffSensitivity << "\n";
         }
         if (keyEdge(window, GLFW_KEY_H, prevKeys)) {
             if (state.analogScope) {
@@ -2723,12 +3554,247 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             std::cout << "AnalogScope line count: " << state.analogLineCount << "\n";
         }
 
+        // --- Line sharpness / smooth mode ---
+        if (keyEdge(window, GLFW_KEY_K, prevKeys)) {
+            state.lineSmooth = !state.lineSmooth;
+            std::cout << "LineSmooth: " << (state.lineSmooth ? "ON (per-pixel)" : "OFF (lines)") << "\n";
+        }
+        if (keyEdge(window, GLFW_KEY_V, prevKeys) && !state.analogScope) {
+            state.lineSharpness = std::min(5.0f, state.lineSharpness + 0.25f);
+            std::cout << "LineSharpness: " << state.lineSharpness << "\n";
+        }
+        if (keyEdge(window, GLFW_KEY_N, prevKeys)) {
+            state.lineSharpness = std::max(0.25f, state.lineSharpness - 0.25f);
+            std::cout << "LineSharpness: " << state.lineSharpness << "\n";
+        }
+
+        // --- TUI toggle & interactivity ---
+        if (keyEdge(window, GLFW_KEY_T, prevKeys)) {
+            tuiEnabled = !tuiEnabled;
+            tuiSelection = -1;
+            if (tuiEnabled) {
+#ifndef _WIN32
+                struct winsize ws;
+                if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+                    termWidth = ws.ws_col;
+                    termHeight = ws.ws_row;
+                }
+#endif
+                if (termWidth < 60 || termHeight < 12) {
+                    std::cout << "\033[?1047h\033[2J\033[H"
+                        "\033[1;31mTUI needs 60x12 terminal (have " << termWidth
+                        << "x" << termHeight << ")\033[0m\n"
+                        "\033[?1047l";
+                    tuiEnabled = false;
+                    continue;
+                }
+                std::cout << "\033[?1047h\033[2J\033[H";
+                std::cout << "\033[?25l";
+                std::cout << "\033[?1000h\033[?1006h"; // enable mouse + SGR
+                std::cout << "\033[0m";
+            } else {
+                std::cout << "\033[?25h";
+                std::cout << "\033[?1006l\033[?1000l"; // disable mouse + SGR
+                std::cout << "\033[?1047l";
+#ifndef _WIN32
+                tcflush(STDIN_FILENO, TCIFLUSH);
+#endif
+            }
+        }
+        if (tuiEnabled) {
+#ifndef _WIN32
+            struct winsize ws;
+            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+                termWidth = ws.ws_col;
+                termHeight = ws.ws_row;
+            }
+#endif
+            // Poll stdin for mouse events (SGR encoding) — Linux only
+#ifndef _WIN32
+            {
+                struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+                while (poll(&pfd, 1, 0) > 0) {
+                    char buf[32];
+                    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf) - 1);
+                    if (n <= 0) break;
+                    buf[n] = 0;
+                    // SGR: ESC [ <btn> ; <cx> ; <cy> M  (press) or m (release)
+                    char* p = buf;
+                    while (p && *p) {
+                        if (p[0] == '\033' && p[1] == '[') {
+                            int btn = 0, cx = 0, cy = 0;
+                            char endc = 0;
+                            if (sscanf(p + 2, "%d;%d;%d%c", &btn, &cx, &cy, &endc) >= 3) {
+                                if (btn == 0 && (endc == 'M' || endc == 'm')) {
+                                    // Row 1 = title, rows 2..17 = params 0..15
+                                    int paramIdx = cy - 2;
+                                    if (paramIdx >= 0 && paramIdx <= 15 && endc == 'M') {
+                                        tuiSelection = (tuiSelection == paramIdx) ? -1 : paramIdx;
+                                    }
+                                } else if (btn == 64 || btn == 65) {
+                                    // Scroll wheel: btn=64 ↑, btn=65 ↓
+                                    int delta = (btn == 64) ? 1 : -1;
+                                    if (tuiSelection >= 0) {
+                                        auto adj = [&](float& v, float step, float mn, float mx) {
+                                            v = std::clamp(v + static_cast<float>(delta) * step, mn, mx);
+                                        };
+                                        switch (tuiSelection) {
+                                            case 1: state.numBars = static_cast<size_t>(std::clamp(static_cast<int>(state.numBars) + delta * 4, static_cast<int>(MIN_BARS), static_cast<int>(state.maxBarsLimit))); break;
+                                            case 2: adj(state.sensitivity, 0.1f, 0.1f, state.maxSensitivityLimit); break;
+                                            case 3: adj(state.zoom, 0.1f, 0.3f, 5.0f); break;
+                                            case 4: adj(state.waveZoom, 0.1f, 0.1f, 10.0f); break;
+                                            case 5: adj(state.waveSpeed, 0.1f, 0.0f, 20.0f); break;
+                                            case 6: adj(state.bloomIntensity, 0.5f, 0.5f, 2.5f); break;
+                                            case 8: adj(state.jumpSensitivity, 0.25f, 0.25f, 5.0f); break;
+                                            case 10: adj(state.diffSensitivity, 0.25f, 0.25f, 5.0f); break;
+                                            case 11: adj(state.limitMultiplier, 0.5f, 0.5f, 10.0f); break;
+                                            case 13: state.gradientColorCount = static_cast<size_t>(std::clamp(static_cast<int>(state.gradientColorCount) + delta, 1, 64)); break;
+                                            case 15: adj(state.lineSharpness, 0.25f, 0.25f, 5.0f); break;
+                                            default: break;
+                                        }
+                                        if (!configSavePath.empty()) saveConfigFile(configSavePath);
+                                    }
+                                }
+                            }
+                            p = strchr(p + 2, '\033');
+                        } else {
+                            p++;
+                        }
+                    }
+                }
+            }
+#endif
+
+            // Arrow keys navigate, Enter/Left/Right adjust
+            auto selPrev = [&]() { tuiSelection = std::max(-1, tuiSelection - 1); };
+            auto selNext = [&]() { tuiSelection = std::min(15, tuiSelection + 1); };
+            auto selVal  = [&](int s) { tuiSelection = (tuiSelection == s) ? -1 : s; };
+            if (keyEdge(window, GLFW_KEY_UP, prevKeys)) selPrev();
+            if (keyEdge(window, GLFW_KEY_DOWN, prevKeys)) selNext();
+            if (keyEdge(window, GLFW_KEY_ENTER, prevKeys) && tuiSelection >= 0) {
+                switch (tuiSelection) {
+                    case 0: mode = static_cast<VisMode>((static_cast<int>(mode) + 1) % 10); break;
+                    case 1: state.numBars = std::min(state.maxBarsLimit, state.numBars + 4); break;
+                    case 2: state.sensitivity = std::min(state.maxSensitivityLimit, state.sensitivity + 0.1f); break;
+                    case 3: state.zoom = std::min(5.0f, state.zoom + 0.1f); break;
+                    case 4: state.waveZoom = std::min(10.0f, state.waveZoom + 0.1f); break;
+                    case 5: state.waveSpeed = std::min(20.0f, state.waveSpeed + 0.1f); break;
+                    case 6: state.bloom = !state.bloom; break;
+                    case 7: state.antiAliasing = !state.antiAliasing; break;
+                    case 8: state.jumpColor = !state.jumpColor; break;
+                    case 9: state.jumpOnGradient = !state.jumpOnGradient; break;
+                    case 10: state.diffColor = !state.diffColor; break;
+                    case 11: state.limitMultiplier = std::min(10.0f, state.limitMultiplier + 0.5f); break;
+                    case 12: state.trueXYMode = static_cast<TrueXYMode>((static_cast<int>(state.trueXYMode) + 1) % 6); break;
+                    case 13: state.gradientColorCount = std::min(size_t(64), state.gradientColorCount + 1); break;
+                    case 14: state.analogScope = !state.analogScope; break;
+                    case 15: state.lineSmooth = !state.lineSmooth; break;
+                }
+                if (!configSavePath.empty()) saveConfigFile(configSavePath);
+            }
+            if (tuiSelection >= 0) {
+                if (keyEdge(window, GLFW_KEY_RIGHT, prevKeys)) {
+                    switch (tuiSelection) {
+                        case 1: state.numBars = std::min(state.maxBarsLimit, state.numBars + 4); break;
+                        case 2: state.sensitivity = std::min(state.maxSensitivityLimit, state.sensitivity + 0.1f); break;
+                        case 3: state.zoom = std::min(5.0f, state.zoom + 0.1f); break;
+                        case 4: state.waveZoom = std::min(10.0f, state.waveZoom + 0.1f); break;
+                        case 5: state.waveSpeed = std::min(20.0f, state.waveSpeed + 0.1f); break;
+                        case 6: state.bloomIntensity = std::min(2.5f, state.bloomIntensity + 0.5f); break;
+                        case 8: state.jumpSensitivity = std::min(5.0f, state.jumpSensitivity + 0.25f); break;
+                        case 10: state.diffSensitivity = std::min(5.0f, state.diffSensitivity + 0.25f); break;
+                        case 11: state.limitMultiplier = std::min(10.0f, state.limitMultiplier + 0.5f); break;
+                        case 13: state.gradientColorCount = std::min(size_t(64), state.gradientColorCount + 1); break;
+                        case 15: state.lineSharpness = std::min(5.0f, state.lineSharpness + 0.25f); break;
+                    }
+                    if (!configSavePath.empty()) saveConfigFile(configSavePath);
+                }
+                if (keyEdge(window, GLFW_KEY_LEFT, prevKeys)) {
+                    switch (tuiSelection) {
+                        case 1: state.numBars = std::max(MIN_BARS, state.numBars - 4); break;
+                        case 2: state.sensitivity = std::max(0.1f, state.sensitivity - 0.1f); break;
+                        case 3: state.zoom = std::max(0.3f, state.zoom - 0.1f); break;
+                        case 4: state.waveZoom = std::max(0.1f, state.waveZoom - 0.1f); break;
+                        case 5: state.waveSpeed = std::max(0.0f, state.waveSpeed - 0.1f); break;
+                        case 6: state.bloomIntensity = std::min(2.5f, std::max(0.5f, state.bloomIntensity - 0.5f)); break;
+                        case 8: state.jumpSensitivity = std::max(0.25f, state.jumpSensitivity - 0.25f); break;
+                        case 10: state.diffSensitivity = std::max(0.25f, state.diffSensitivity - 0.25f); break;
+                        case 11: state.limitMultiplier = std::max(0.5f, state.limitMultiplier - 0.5f); break;
+                        case 13: state.gradientColorCount = std::max(size_t(1), state.gradientColorCount - 1); break;
+                        case 15: state.lineSharpness = std::max(0.25f, state.lineSharpness - 0.25f); break;
+                    }
+                    if (!configSavePath.empty()) saveConfigFile(configSavePath);
+                }
+            }
+            // Escape exits TUI
+            if (keyEdge(window, GLFW_KEY_ESCAPE, prevKeys)) {
+                tuiEnabled = false;
+                std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l";
+#ifndef _WIN32
+                tcflush(STDIN_FILENO, TCIFLUSH);
+#endif
+            }
+        }
+
         // --- Audio + FFT ---
         audio.readLatestStereo(leftBuffer.data(), rightBuffer.data(), FFT_SIZE);
         for (size_t i = 0; i < FFT_SIZE; ++i) {
             sampleBuffer[i] = (leftBuffer[i] + rightBuffer[i]) * 0.5f;
         }
         fft::computeMagnitudeSpectrum(sampleBuffer.data(), FFT_SIZE, magnitudes);
+
+        if (state.jumpColor) {
+            float peak = 0.0f;
+            for (size_t i = 0; i < FFT_SIZE; ++i) {
+                float absVal = fabsf(sampleBuffer[i]);
+                if (absVal > peak) peak = absVal;
+            }
+            jumpBg += 0.02f * (peak - jumpBg);
+            float bg = fmaxf(jumpBg, 0.0001f);
+            float delta = peak - jumpLastPeak;
+            jumpLastPeak = jumpLastPeak * 0.5f + peak * 0.5f;
+            if (jumpCooldown > 0.0f) jumpCooldown -= 1.0f;
+            float threshold = fmaxf(bg * 0.4f / state.jumpSensitivity, 0.0008f);
+            if (delta > threshold && peak > 0.002f && jumpCooldown <= 0.0f) {
+                if (state.jumpOnGradient && state.colorMode == ColorMode::RandomGradient) {
+                    randomizeGradient(state, rng);
+                } else {
+                    state.colorMode = ColorMode::RandomSolid;
+                    state.randomSolid = randomColor(rng, state.colorBrightness);
+                }
+                jumpCooldown = 12.0f;
+            }
+        }
+
+        // --- D key: spectral difference detection (most different sound) ---
+        if (state.diffColor) {
+            if (!diffRefInit) {
+                diffRefMag = magnitudes;
+                diffRefInit = true;
+            }
+            float specDiff = 0.0f;
+            size_t nBins = std::min(magnitudes.size(), diffRefMag.size());
+            for (size_t i = 0; i < nBins; ++i) {
+                float d = fabsf(magnitudes[i] - diffRefMag[i]);
+                specDiff += d;
+                diffRefMag[i] += 0.02f * (magnitudes[i] - diffRefMag[i]);
+            }
+            diffBg += 0.02f * (specDiff - diffBg);
+            float dBg = fmaxf(diffBg, 0.001f);
+            float dDelta = specDiff - diffLastPeak;
+            diffLastPeak = diffLastPeak * 0.5f + specDiff * 0.5f;
+            if (diffCooldown > 0.0f) diffCooldown -= 1.0f;
+            float dThresh = fmaxf(dBg * 0.4f / state.diffSensitivity, 0.005f);
+            if (dDelta > dThresh && diffCooldown <= 0.0f) {
+                if (state.jumpOnGradient && state.colorMode == ColorMode::RandomGradient) {
+                    randomizeGradient(state, rng);
+                } else {
+                    state.colorMode = ColorMode::RandomSolid;
+                    state.randomSolid = randomColor(rng, state.colorBrightness);
+                }
+                diffCooldown = 12.0f;
+            }
+        }
 
         modes::ModeOutput output;
         const float time = static_cast<float>(glfwGetTime());
@@ -2778,6 +3844,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
 
         shader.use();
         shader.setFloat("uZoom", state.zoom);
+        shader.setFloat("uBloomIntensity", state.bloom ? state.bloomIntensity : 0.0f);
 
         if (!output.fillVertices.empty()) {
             glBindBuffer(GL_ARRAY_BUFFER, fillVBO);
@@ -2855,6 +3922,165 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
 
         glfwSwapBuffers(window);
         glfwPollEvents();
+
+        if (tuiEnabled) {
+            static double lastTuiFrame = 0.0;
+            double now = glfwGetTime();
+            if (now - lastTuiFrame >= 0.2) {
+                lastTuiFrame = now;
+#ifndef _WIN32
+                struct winsize ws;
+                if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+                    termWidth = ws.ws_col;
+                    termHeight = ws.ws_row;
+                }
+#endif
+                if (termWidth < 60 || termHeight < 12) {
+                    tuiEnabled = false;
+                    std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l";
+#ifndef _WIN32
+                    tcflush(STDIN_FILENO, TCIFLUSH);
+#endif
+                    continue;
+                }
+                int hh = static_cast<int>(now) / 3600;
+                int mm = (static_cast<int>(now) % 3600) / 60;
+                int ss = static_cast<int>(now) % 60;
+                static double fpsLast = 0.0;
+                static float fpsVal = 60.0f;
+                if (now - fpsLast > 0.5) {
+                    fpsVal = static_cast<float>(1.0 / std::max(now - fpsLast, 0.001));
+                    fpsLast = now;
+                }
+
+                auto tag = [](bool v) -> const char* {
+                    return v ? "\033[32m\xe2\x97\x8f\033[0m" : "\033[90m\xe2\x97\x8b\033[0m";
+                };
+                auto xym = [](TrueXYMode m) -> const char* {
+                    switch (m) { case TrueXYMode::Scatter: return "Scat"; case TrueXYMode::LineStrip: return "Line";
+                    case TrueXYMode::Both: return "Both"; case TrueXYMode::FilledTrail: return "Fill";
+                    case TrueXYMode::GlowScatter: return "Glow"; case TrueXYMode::PhosphorTrail: return "Phos"; } return "?";
+                };
+                auto cm  = [](ColorMode m) -> const char* {
+                    switch (m) { case ColorMode::Normal: return "Nrm"; case ColorMode::RandomSolid: return "Sol";
+                    case ColorMode::RandomGradient: return "Grd"; } return "?";
+                };
+                auto mn = [](VisMode m) -> const char* {
+                    switch (m) { case VisMode::TrueXY: return "XY"; case VisMode::Oscilloscope: return "Osc";
+                    case VisMode::SpectrumBars: return "Bar"; case VisMode::MirroredWaveform: return "Mir";
+                    case VisMode::CircularOscilloscope: return "COs"; case VisMode::CircularSpectrum: return "CSp";
+                    case VisMode::Lissajous: return "Lis"; case VisMode::DenseSpectrum: return "Den";
+                    case VisMode::CircularSpectrumFilled: return "CFi"; case VisMode::PulseRings: return "Pls"; } return "?";
+                };
+
+                int cw = termWidth;
+                std::cout << "\033[1;1H";
+
+                // ── Title bar ──
+                std::cout << "\033[1;36m\xe2\x95\x8e\xe2\x95\x90\xe2\x95\x90"
+                    " \033[1;37mChills\033[1;36m \xe2\x95\x90\xe2\x95\x90 "
+                    << mn(mode) << " [" << int(mode) << "]"
+                    << " \xe2\x95\x90\xe2\x95\x90 "
+                    << (hh < 10 ? "0" : "") << hh << ":" << (mm < 10 ? "0" : "") << mm
+                    << ":" << (ss < 10 ? "0" : "") << ss
+                    << " \xe2\x95\x90\xe2\x95\x90 " << int(fpsVal) << " FPS\033[1;36m";
+                for (int i = 0; i < cw - 46; ++i) std::cout << "\xe2\x95\x90";
+                std::cout << "\xe2\x95\x8f\033[0m\n";
+
+                // ── Compact parameter rows ──
+                auto pRow = [&](int idx, const char* label, const std::string& val, bool sel) {
+                    if (sel) std::cout << "\033[48;5;236m";
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m"
+                              << (sel ? "\033[48;5;236m\033[1;97m" : "\033[1m") << label;
+                    if (sel) std::cout << "\033[48;5;236m\033[0m\033[48;5;236m";
+                    else std::cout << "\033[0m";
+                    std::cout << " " << val;
+                    int used = 3 + static_cast<int>(strlen(label)) + 1 + static_cast<int>(val.size());
+                    if (sel) std::cout << "\033[48;5;236m";
+                    for (int i = used; i < cw - 3; ++i) std::cout << " ";
+                    if (sel) std::cout << "\033[0m";
+                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
+                };
+
+                // 20 params in 20 rows, no section headers to save space
+                auto rv = [&](int idx, const char* l, const std::string& v) { pRow(idx, l, v, tuiSelection == idx); };
+                rv(0,  "Mode",       std::to_string(int(mode)) + " " + mn(mode));
+                rv(1,  "Bars",       std::to_string(state.numBars));
+                rv(2,  "Sens",       std::to_string(state.sensitivity));
+                rv(3,  "Zoom",       std::to_string(state.zoom));
+                rv(4,  "WZoom",      std::to_string(state.waveZoom));
+                rv(5,  "WSpeed",     std::to_string(state.waveSpeed));
+                rv(6,  "Bloom",      std::string(tag(state.bloom)) + "  Int " + std::to_string(state.bloomIntensity));
+                rv(7,  "AA",         std::string(tag(state.antiAliasing)));
+                rv(8,  "Jump",       std::string(tag(state.jumpColor)) + "  Sens " + std::to_string(state.jumpSensitivity));
+                rv(9,  "JGrad",      std::string(tag(state.jumpOnGradient)));
+                rv(10, "Diff",       std::string(tag(state.diffColor)) + "  Sens " + std::to_string(state.diffSensitivity));
+                rv(11, "B-AMU",      std::to_string(state.limitMultiplier));
+                rv(12, "TrueXY",     xym(state.trueXYMode));
+                rv(13, "Grad",       std::to_string(state.gradientColorCount) + " " + cm(state.colorMode));
+                rv(14, "AScope",     std::string(tag(state.analogScope)));
+                rv(15, "Smooth",     std::string(tag(state.lineSmooth)) + "  Sharp " + std::to_string(state.lineSharpness));
+
+                int usedRows = 17; // title + 16 param rows
+                int remain = termHeight - usedRows - 1;
+
+                // ── Mini spectrum (only if space) ──
+                if (remain >= 4 && !magnitudes.empty()) {
+                    std::cout << "\033[1;36m\xe2\x95\xa0";
+                    for (int i = 0; i < cw - 4; ++i) std::cout << "\xe2\x95\x90";
+                    std::cout << "\xe2\x95\xa3\033[0m\n";
+                    int specH = std::min(remain - 1, 6);
+                    size_t nBins = magnitudes.size();
+                    for (int r = 0; r < specH; ++r) {
+                        float val = 0.0f;
+                        size_t bi = static_cast<size_t>(static_cast<float>(r) / static_cast<float>(specH) * static_cast<float>(nBins));
+                        bi = std::min(bi, nBins - 1);
+                        val = std::clamp(magnitudes[bi] * 100.0f, 0.0f, 1.0f);
+                        int bw = std::max(1, cw - 7);
+                        int filled = static_cast<int>(val * static_cast<float>(bw));
+                        std::cout << "\033[36m\xe2\x95\x91\033[0m \033[32m";
+                        for (int i = 0; i < bw; ++i)
+                            std::cout << (i < filled ? "\xe2\x96\x88" : "\xe2\x96\x91");
+                        std::cout << "\033[0m \033[36m\xe2\x95\x91\033[0m\n";
+                    }
+                    usedRows += 1 + specH;
+                    remain = termHeight - usedRows - 1;
+                }
+
+                // ── Keybinds (if space) ──
+                if (remain >= 2) {
+                    std::cout << "\033[1;36m\xe2\x95\xa0";
+                    for (int i = 0; i < cw - 4; ++i) std::cout << "\xe2\x95\x90";
+                    std::cout << "\xe2\x95\xa3\033[0m\n";
+                    usedRows++;
+
+                    auto kRow = [&](const std::string& txt) {
+                        if (usedRows >= termHeight - 1) { usedRows++; return; }
+                        std::cout << "\033[36m\xe2\x95\x91\033[0m " << txt;
+                        int len = 2 + static_cast<int>(txt.size());
+                        for (int i = len; i < cw - 2; ++i) std::cout << " ";
+                        std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
+                        usedRows++;
+                    };
+                    kRow("\xe2\x86\x91\xe2\x86\x93 Nav  \xe2\x86\x90\xe2\x86\x92/Enter Adj  Esc/T Exit  0-9 Mode");
+                    kRow("J Jump  D Diff  R Sol  G Grad  H AScope  L Bloom  A AA  K Smooth");
+                    if (remain >= 4)
+                        kRow("Q Sc W Ln E Bt I Fi O Gl P Ph  / J+ \\ J-  U D+ Y D-  V+ N-");
+                    if (remain >= 5)
+                        kRow("M Mic  S Sys  , . GradCt  [ ] BlmSz  B AMU  -= Zoom");
+                }
+
+                // ── Bottom border ──
+                if (usedRows < termHeight) {
+                    std::cout << "\033[1;36m\xe2\x95\x9a";
+                    for (int i = 0; i < std::min(cw - 4, termWidth - 2); ++i) std::cout << "\xe2\x95\x90";
+                    std::cout << "\xe2\x95\x9d\033[0m\n";
+                }
+
+                std::cout << "\033[J";
+                std::cout.flush();
+            }
+        }
     }
 
     audio.stop();
@@ -2871,6 +4097,8 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         glDeleteFramebuffers(1, &msaaFBO);
     }
 
+    // Restore terminal state on exit
+    std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l";
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;
