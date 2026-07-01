@@ -2,8 +2,7 @@
 - asked ai to make this for fun
 - I didn't write a single code
 - just use the 5 folder
-- ignore the vkcube folder
-- 5 isth current working version
+- 5 is th current working version
 - do --help on the visualizer executable
 
 # Tools used
@@ -14,4 +13,4 @@
 ### Only took a day I think
 
 #### After dumping this project for like a week or 2 i decided to update this 
-##### Whatever atleast i had fun, I suppose
+##### Whatever at least i had fun, I suppose.
