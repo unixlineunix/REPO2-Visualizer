@@ -6,6 +6,7 @@
 #include <cstddef>
 
 enum class CaptureSource { Microphone, SystemAudio };
+enum class CaptureMode  { Microphone, SystemAudio, Both, Reduction };
 
 class AudioCapture {
 public:
@@ -17,6 +18,7 @@ public:
 
     bool start();
     bool switchSource(CaptureSource source);
+    bool switchMode(CaptureMode mode);
     void stop();
 
     void readLatest(float* out, size_t count) const;
@@ -24,11 +26,15 @@ public:
 
     size_t ringSize() const noexcept { return m_ringSize; }
     CaptureSource currentSource() const noexcept { return m_source; }
+    CaptureMode   currentMode()   const noexcept { return m_mode; }
 
 private:
     static void dataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount);
+    static void dataCallback2(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount);
     void pushSamples(const float* samples, size_t count);
-    bool initAndStartDevice(CaptureSource source);
+    void pushSamples2(const float* samples, size_t count);
+    bool initAndStartDevice(CaptureSource source, int devIndex);
+    void stopDevice(int devIndex);
 
     size_t m_ringSize;
     std::vector<float> m_ringBuffer;
@@ -37,8 +43,11 @@ private:
 
     ma_context m_context;
     bool m_contextInitialized;
-    ma_device m_device;
-    bool m_deviceInitialized;
+
+    // Device 0 (primary) and device 1 (secondary for Both mode)
+    ma_device m_device[2];
+    bool      m_deviceInitialized[2];
     bool m_running;
     CaptureSource m_source;
+    CaptureMode   m_mode;
 };

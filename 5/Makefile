@@ -1,14 +1,14 @@
 CXX      := g++
 CXXFLAGS := -std=c++20 -I.
-LDFLAGS  := -lglfw -lGL -lasound
+LDFLAGS  := -lglfw -lGL -lasound -limgui
 
-OBJS := main.o modes.o audio.o fft.o shader.o vis_state.o glad.o
+OBJS := main.o modes.o audio.o fft.o shader.o vis_state.o glad.o imgui_impl_glfw.o imgui_impl_opengl3.o
 
 # Windows cross-compilation with MinGW
 MINGW_CXX      := x86_64-w64-mingw32-g++
-MINGW_CXXFLAGS := -std=c++20 -I. -D_GLFW_WIN32
+MINGW_CXXFLAGS := -std=c++20 -I. -I/tmp/glfw_mingw_build -D_GLFW_WIN32
 MINGW_LDFLAGS  := -L/tmp/glfw_mingw_build -lglfw3 -lopengl32 -lgdi32 -lwinmm -static-libgcc -static-libstdc++ -static
-MINGW_OBJS     := main_mingw.o modes_mingw.o audio_mingw.o fft_mingw.o shader_mingw.o vis_state_mingw.o glad_mingw.o
+MINGW_OBJS     := main_mingw.o modes_mingw.o audio_mingw.o fft_mingw.o shader_mingw.o vis_state_mingw.o glad_mingw.o imgui_mingw.o imgui_draw_mingw.o imgui_tables_mingw.o imgui_widgets_mingw.o imgui_impl_glfw_mingw.o imgui_impl_opengl3_mingw.o
 
 .PHONY: all clean win32
 
@@ -48,6 +48,31 @@ glad_mingw.o: glad.c
 
 glad.o: glad.c
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+imgui_impl_glfw.o: imgui_impl_glfw.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+imgui_impl_opengl3.o: imgui_impl_opengl3.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# MinGW imgui objects
+imgui_mingw.o: imgui.cpp
+	$(MINGW_CXX) $(MINGW_CXXFLAGS) -c $< -o $@
+
+imgui_draw_mingw.o: imgui_draw.cpp
+	$(MINGW_CXX) $(MINGW_CXXFLAGS) -c $< -o $@
+
+imgui_tables_mingw.o: imgui_tables.cpp
+	$(MINGW_CXX) $(MINGW_CXXFLAGS) -c $< -o $@
+
+imgui_widgets_mingw.o: imgui_widgets.cpp
+	$(MINGW_CXX) $(MINGW_CXXFLAGS) -c $< -o $@
+
+imgui_impl_glfw_mingw.o: imgui_impl_glfw.cpp
+	$(MINGW_CXX) $(MINGW_CXXFLAGS) -c $< -o $@
+
+imgui_impl_opengl3_mingw.o: imgui_impl_opengl3.cpp
+	$(MINGW_CXX) $(MINGW_CXXFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(OBJS) $(MINGW_OBJS) visualizer visualizer.exe

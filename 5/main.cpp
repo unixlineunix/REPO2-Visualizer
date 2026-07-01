@@ -7,8 +7,13 @@
 #include "modes.hxx"
 #include "vis_state.hxx"
 
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -21,15 +26,192 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 #ifndef _WIN32
 #include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #else
 #include <direct.h>
 #endif
 
 namespace {
+
+std::vector<std::string> split_utf8(const std::string& str) {
+    std::vector<std::string> chars;
+    for (size_t i = 0; i < str.size();) {
+        int len = 1;
+        unsigned char c = str[i];
+        if ((c & 0x80) == 0) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        chars.push_back(str.substr(i, len));
+        i += len;
+    }
+    return chars;
+}
+
+struct Color {
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+    constexpr Color() = default;
+    constexpr Color(uint8_t r_val, uint8_t g_val, uint8_t b_val) : r(r_val), g(g_val), b(b_val) {}
+    bool operator==(const Color& o) const { return r == o.r && g == o.g && b == o.b; }
+};
+
+struct Cell {
+    std::string symbol = " ";
+    Color fg = {220, 220, 220};
+    Color bg = {12, 14, 20};
+    bool has_fg = false;
+    bool has_bg = true;
+};
+
+class TuiRendererLocal {
+public:
+    int width = 0;
+    int height = 0;
+    std::vector<std::vector<Cell>> grid;
+
+    static constexpr Color BG_DARK = {12, 14, 20};
+    static constexpr Color BORDER = {45, 60, 80};
+    static constexpr Color TEXT_WHITE = {235, 240, 250};
+    static constexpr Color TEXT_GRAY = {110, 125, 145};
+    static constexpr Color TEAL = {30, 200, 180};
+    static constexpr Color CYAN = {50, 180, 240};
+    static constexpr Color GREEN = {60, 220, 110};
+    static constexpr Color YELLOW = {230, 190, 40};
+    static constexpr Color ORANGE = {240, 120, 30};
+    static constexpr Color RED = {245, 65, 85};
+    static constexpr Color MAGENTA = {210, 60, 210};
+
+    static Color interpolate(Color c1, Color c2, double t) {
+        t = std::max(0.0, std::min(1.0, t));
+        return {
+            static_cast<uint8_t>(c1.r + (c2.r - c1.r) * t),
+            static_cast<uint8_t>(c1.g + (c2.g - c1.g) * t),
+            static_cast<uint8_t>(c1.b + (c2.b - c1.b) * t)
+        };
+    }
+
+    void resize(int w, int h) {
+        width = w;
+        height = h;
+        grid.assign(height, std::vector<Cell>(width));
+        clear();
+    }
+
+    void clear() {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                grid[y][x] = { " ", TEXT_WHITE, BG_DARK, false, true };
+            }
+        }
+    }
+
+    void draw_cell(int x, int y, const std::string& sym, Color fg, bool has_fg = true, Color bg = {}, bool has_bg = false) {
+        if (x < 0 || x >= width || y < 0 || y >= height) return;
+        grid[y][x].symbol = sym;
+        grid[y][x].fg = fg;
+        grid[y][x].bg = bg;
+        grid[y][x].has_fg = has_fg;
+        grid[y][x].has_bg = has_bg;
+    }
+
+    void draw_string(int x, int y, const std::string& str, Color fg, bool has_fg = true, Color bg = {}, bool has_bg = false) {
+        auto syms = split_utf8(str);
+        for (int i = 0; i < (int)syms.size(); ++i) {
+            if (x + i >= width) break;
+            draw_cell(x + i, y, syms[i], fg, has_fg, bg, has_bg);
+        }
+    }
+
+    void draw_box(int x, int y, int w, int h, const std::string& title, Color border_color, Color title_color) {
+        if (w <= 2 || h <= 2) return;
+        draw_cell(x, y, "┌", border_color);
+        draw_cell(x + w - 1, y, "┐", border_color);
+        draw_cell(x, y + h - 1, "└", border_color);
+        draw_cell(x + w - 1, y + h - 1, "┘", border_color);
+        for (int j = 1; j < h - 1; ++j) {
+            draw_cell(x, y + j, "│", border_color);
+            draw_cell(x + w - 1, y + j, "│", border_color);
+        }
+        int title_start = x + 2;
+        int title_end = title_start + title.length();
+        for (int i = 1; i < w - 1; ++i) {
+            int screen_x = x + i;
+            if (!title.empty() && screen_x >= title_start && screen_x < title_end) {
+                draw_cell(screen_x, y, std::string(1, title[screen_x - title_start]), title_color);
+            } else if (!title.empty() && (screen_x == title_start - 1 || screen_x == title_end)) {
+                draw_cell(screen_x, y, " ", border_color);
+            } else {
+                draw_cell(screen_x, y, "─", border_color);
+            }
+            draw_cell(screen_x, y + h - 1, "─", border_color);
+        }
+    }
+
+    void draw_bar(int x, int y, int length, double percent, Color start, Color end) {
+        if (length <= 0) return;
+        percent = std::max(0.0, std::min(100.0, percent));
+        double val = (percent / 100.0) * length;
+        int filled = (int)val;
+        double fraction = val - filled;
+        for (int i = 0; i < length; ++i) {
+            Color color = interpolate(start, end, (double)i / length);
+            if (i < filled) {
+                draw_cell(x + i, y, "█", color);
+            } else if (i == filled && fraction > 0.0) {
+                std::string block = "░";
+                int idx = (int)(fraction * 8);
+                if (idx <= 1) block = "░";
+                else if (idx <= 3) block = "▒";
+                else if (idx <= 6) block = "▓";
+                else block = "█";
+                draw_cell(x + i, y, block, color);
+            } else {
+                draw_cell(x + i, y, "░", TEXT_GRAY);
+            }
+        }
+    }
+
+    void render() {
+        std::ostringstream out;
+        out << "\033[H";
+        Color current_fg = {0, 0, 0};
+        Color current_bg = {0, 0, 0};
+        bool fg_set = false;
+        bool bg_set = false;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const Cell& cell = grid[y][x];
+                if (cell.has_bg) {
+                    if (!bg_set || !(current_bg == cell.bg)) {
+                        out << "\033[48;2;" << (int)cell.bg.r << ";" << (int)cell.bg.g << ";" << (int)cell.bg.b << "m";
+                        current_bg = cell.bg;
+                        bg_set = true;
+                    }
+                } else {
+                    if (bg_set) { out << "\033[49m"; bg_set = false; }
+                }
+                if (cell.has_fg) {
+                    if (!fg_set || !(current_fg == cell.fg)) {
+                        out << "\033[38;2;" << (int)cell.fg.r << ";" << (int)cell.fg.g << ";" << (int)cell.fg.b << "m";
+                        current_fg = cell.fg;
+                        fg_set = true;
+                    }
+                } else {
+                    if (fg_set) { out << "\033[39m"; fg_set = false; }
+                }
+                out << cell.symbol;
+            }
+            if (y < height - 1) out << "\n";
+        }
+        out << "\033[0m";
+        std::cout << out.str() << std::flush;
+    }
+};
 
 int WINDOW_WIDTH  = 1280;
 int WINDOW_HEIGHT = 720;
@@ -40,6 +222,7 @@ constexpr size_t FFT_SIZE         = 4096;
 constexpr size_t MAX_LINE_VERTICES = 32768;
 constexpr size_t MAX_FILL_VERTICES = 131072;
 constexpr size_t MAX_GLOW_VERTICES = 262144;
+constexpr size_t MAX_TIP_VERTICES  = 262144;
 constexpr size_t VERTEX_FLOATS     = 6; // x, y, r, g, b, pointSize
 
 constexpr size_t MIN_BARS = 2;
@@ -139,6 +322,7 @@ constexpr const char* kDetailText = R"DOC(
     lineVertices   x,y,r,g,b,point_size per vertex (std::vector<float>)
     fillVertices   triangles for filled areas
     glowVertices   additive glow quads (optional)
+    tipVertices    bloom balls drawn as GL_POINTS (optional)
     lineSegments   {GLsizei first, GLsizei count} per drawable segment
     linePrimitive  GL_LINE_STRIP or GL_POINTS
     linePoints     true if lineVertices should be drawn as GL_POINTS
@@ -218,10 +402,12 @@ constexpr const char* kDetailText = R"DOC(
     colorMode                   Normal | RandomSolid | RandomGradient
     gradientColors              user-defined gradient palette
     bloom, bloomIntensity, bloomSize   bloom toggle and parameters
+    bloomSteps, bloomRings, bloomBallIntensity   bloom ball params
     antiAliasing                MSAA toggle
     inputMode                   Microphone | SystemAudio
     trueXYMode, trueXYLines     TrueXY sub-mode and line-overlay toggle
     analogScope*                analog scope state (see section 4)
+    windowOpacity               GLFW window opacity (0.1-1.0)
 
   resolveColor(state, base, t)
     Returns a Color3 depending on colorMode:
@@ -472,8 +658,14 @@ enum class VisMode {
     CircularSpectrum     = 5,
     Lissajous            = 6,
     DenseSpectrum        = 7,
-    CircularSpectrumFilled = 8,
-    PulseRings           = 9
+    CircularMesh         = 8,
+    PulseRings           = 9,
+    ParticleField        = 10,
+    LedBars              = 11,
+    CircularSpectrumFilled = 12,
+    DenseSpectrumMirrored   = 13,
+    OscilloscopeLegacy      = 14,
+    ParticleGrid            = 15
 };
 
 const char* modeName(VisMode mode) {
@@ -486,8 +678,14 @@ const char* modeName(VisMode mode) {
         case VisMode::CircularSpectrum:       return "5: Circular Spectrum";
         case VisMode::Lissajous:              return "6: Lissajous";
         case VisMode::DenseSpectrum:          return "7: Dense Spectrum";
-        case VisMode::CircularSpectrumFilled: return "8: Circular Spectrum (Filled)";
+        case VisMode::CircularMesh:           return "8: Circular Mesh";
         case VisMode::PulseRings:             return "9: Pulse Rings";
+        case VisMode::ParticleField:          return "10: Spiral Galaxy";
+        case VisMode::LedBars:                return "11: LED Bars";
+        case VisMode::CircularSpectrumFilled: return "12: Circular Spectrum (Filled)";
+        case VisMode::DenseSpectrumMirrored:   return "13: Mirrored Dense Spectrum";
+        case VisMode::OscilloscopeLegacy:      return "14: Oscilloscope (Legacy)";
+        case VisMode::ParticleGrid:            return "15: Particle Grid";
     }
     return "unknown";
 }
@@ -541,13 +739,18 @@ void resizeBarVectors(const VisState& state,
                        std::vector<float>& spectrumHeights,
                        std::vector<float>& circularHeights,
                        std::vector<float>& denseHeights,
-                       std::vector<float>& filledHeights) {
+                       std::vector<float>& filledHeights,
+                       std::vector<float>& smoothedColumns,
+                       std::vector<float>& smoothedHeights) {
     spectrumHeights.resize(state.numBars, 0.0f);
     circularHeights.resize(state.numBars, 0.0f);
     filledHeights.resize(state.numBars, 0.0f);
 
     const size_t denseCount = std::min<size_t>(state.numBars * 2, DENSE_BAR_CAP);
     denseHeights.resize(denseCount, 0.0f);
+
+    smoothedColumns.resize(state.numBars, 0.0f);
+    smoothedHeights.resize(state.numBars, 0.0f);
 }
 
 bool createMsaaFramebuffer(int width, int height, GLuint& fbo, GLuint& colorRBO) {
@@ -596,6 +799,8 @@ int main(int argc, char* argv[]) {
     bool startBloom = false;
     float startBloomIntensity = -1.0f;
     bool startAntiAlias = false;
+    bool startGlow = false;
+    bool flagSetGlow = false;
     bool startJumpColor = false;
     float startJumpSens = -1.0f;
     size_t startGradColors = 0;
@@ -614,17 +819,54 @@ int main(int argc, char* argv[]) {
     bool startJumpGrad = false;
     bool flagSetAA = false;
     size_t startParticles = 0;
+    bool startTransparentFb = false;
+    bool flagSetTransparentFb = false;
     float startBAmu = -1.0f;
     bool startDiffColor = false;
     bool flagSetDiff = false;
     float startDiffSens = -1.0f;
-    bool startSystem = false;
-    bool startMic = false;
+    int startCaptureMode = -1; // -1=unset, 0=mic, 1=system, 2=both
     std::string configPath;
     std::string configSavePath;
     bool flagLoadConfig = false;
+    int startBloomSteps = -1;
+    int startBloomRings = -1;
+    float startBloomBallIntensity = -1.0f;
+    float startBloomBallAmount = -1.0f;
+    float startWindowOpacity = -1.0f;
+    float startParticleSize = -1.0f;
+    bool startBarsOnly = false;
+    bool flagSetBarsOnly = false;
+    bool startLinesOnly = false;
+    bool flagSetLinesOnly = false;
+    bool startParticlesOnly = false;
+    bool flagSetParticlesOnly = false;
+    float startSimSpeed = -1.0f;
+    int startBloomShape = -1;
+    float startCenterSensitivity = -1.0f;
+    bool startLineSmooth = false;
+    bool flagSetLineSmooth = false;
+    float startLineSharpness = -1.0f;
+    int startColorMode = -1;
+    size_t startMinBars = 0;
+    size_t startMaxBars = 0;
+    size_t startDenseBarCap = 0;
+    int startMSAASamples = -1;
+    bool startControlWindow = false;
+    bool flagSetControlWindow = false;
+    bool flagSetColor = false;
+    float startColor_r = 0.2f, startColor_g = 1.0f, startColor_b = 1.0f;
+    Color3 startGradientColors[64];
+    size_t startGradientCount = 0;
     bool tuiOnly = false;
     bool tuiEnabled = false;
+    bool controlWindow =
+#ifdef _WIN32
+        true
+#else
+        false
+#endif
+    ;
     int tuiSelection = -1;
     int termWidth = 80, termHeight = 24;
 
@@ -653,44 +895,105 @@ int main(int argc, char* argv[]) {
         std::string line;
         while (std::getline(file, line)) {
             if (line.empty() || line[0] == '#') continue;
-            std::istringstream iss(line);
-            std::string token;
-            if (!(iss >> token)) continue;
-            std::string val;
-            std::getline(iss >> std::ws, val);
+            std::string key, val;
+            size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                key = line.substr(0, eq);
+                val = line.substr(eq + 1);
+            } else {
+                std::istringstream iss(line);
+                if (!(iss >> key)) continue;
+                std::getline(iss >> std::ws, val);
+            }
+            auto tr = [](std::string& s) {
+                size_t a = s.find_first_not_of(" \t\r\n");
+                size_t b = s.find_last_not_of(" \t\r\n");
+                s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+            };
+            tr(key); tr(val);
+            if (key.empty()) continue;
+            // Strip leading -- for backward compat with old format
+            if (key.size() >= 2 && key[0] == '-' && key[1] == '-') key = key.substr(2);
+            std::string keyLower = key;
+            std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             const char* v = val.empty() ? nullptr : val.c_str();
 
-            // Map config tokens to start variables (same as CLI flags)
-            if (token == "--mode" && v) { startMode = std::atoi(v); }
-            else if (token == "--bars" && v) { startBars = static_cast<size_t>(std::max(0, std::atoi(v))); }
-            else if (token == "--sensitivity" && v) { startSensitivity = std::atof(v); }
-            else if (token == "--zoom" && v) { startZoom = std::atof(v); }
-            else if (token == "--wave-zoom" && v) { startWaveZoom = std::atof(v); }
-            else if (token == "--wave-speed" && v) { startWaveSpeed = std::atof(v); }
-            else if (token == "--bloom" || token == "-b") { flagSetBloom = true; if (v) tryBool(v, startBloom); else startBloom = true; }
-            else if (token == "--bloom-intensity" && v) { startBloomIntensity = std::atof(v); }
-            else if (token == "--B-amu" && v) { startBAmu = std::atof(v); }
-            else if (token == "--anti-alias") { flagSetAA = true; if (v) tryBool(v, startAntiAlias); else startAntiAlias = true; }
-            else if (token == "--lighter-color") { if (v) tryBool(v, startLighter); else startLighter = true; }
-            else if (token == "--darker-color") { if (v) tryBool(v, startDarker); else startDarker = true; }
-            else if (token == "--jump-color" || token == "-j") { flagSetJump = true; if (v) tryBool(v, startJumpColor); else startJumpColor = true; }
-            else if (token == "--jump-on-gradient" || token == "--jumpOnGradient") { flagSetJumpGrad = true; if (v) tryBool(v, startJumpGrad); else startJumpGrad = true; }
-            else if (token == "--jump-sensitivity" && v) { startJumpSens = std::atof(v); }
-            else if (token == "--diff-color") { flagSetDiff = true; if (v) tryBool(v, startDiffColor); else startDiffColor = true; }
-            else if (token == "--diff-sensitivity" && v) { startDiffSens = std::atof(v); }
-            else if (token == "--gradient-colors" && v) { startGradColors = static_cast<size_t>(std::max(0, std::atoi(v))); }
-            else if (token == "--truexy-mode" && v) { startTrueXYMode = std::atoi(v); }
-            else if (token == "--truexy-lines") { flagSetTrueXYLines = true; if (v) tryBool(v, startTrueXYLines); else startTrueXYLines = true; }
-            else if (token == "--analog-scope") { if (v) tryBool(v, startAnalogScope); else startAnalogScope = true; }
-            else if (token == "--analog-decay" && v) { startAnalogDecay = std::atof(v); }
-            else if (token == "--analog-resolution" && v) { startAnalogRes = static_cast<size_t>(std::max(64, std::atoi(v))); }
-            else if (token == "--analog-lines" && v) { startAnalogLines = static_cast<size_t>(std::max(1, std::atoi(v))); }
-            else if (token == "--particles" && v) { startParticles = static_cast<size_t>(std::max(1, std::atoi(v))); }
-            else if (token == "--width" && v) { WINDOW_WIDTH = std::max(320, std::atoi(v)); }
-            else if (token == "--height" && v) { WINDOW_HEIGHT = std::max(240, std::atoi(v)); }
-            else if (token == "--system") { if (v) tryBool(v, startSystem); else startSystem = true; }
-            else if (token == "--mic") { if (v) tryBool(v, startMic); else startMic = true; }
-            else std::cerr << "Config: unknown token '" << token << "'\n";
+            if (key == "mode" && v) { startMode = std::atoi(v); }
+            else if (key == "bars" && v) { startBars = static_cast<size_t>(std::max(0, std::atoi(v))); }
+            else if (key == "sensitivity" && v) { startSensitivity = std::atof(v); }
+            else if (key == "zoom" && v) { startZoom = std::atof(v); }
+            else if (key == "wave-zoom" && v) { startWaveZoom = std::atof(v); }
+            else if (key == "wave-speed" && v) { startWaveSpeed = std::atof(v); }
+            else if (key == "bloom" || key == "b") { flagSetBloom = true; if (v) tryBool(v, startBloom); else startBloom = true; }
+            else if (key == "bloom-intensity" && v) { startBloomIntensity = std::atof(v); }
+            else if (key == "B-amu" && v) { startBAmu = std::atof(v); }
+            else if (key == "anti-alias") { flagSetAA = true; if (v) tryBool(v, startAntiAlias); else startAntiAlias = true; }
+            else if (key == "glow") { flagSetGlow = true; if (v) tryBool(v, startGlow); else startGlow = true; }
+            else if (key == "lighter-color") { if (v) tryBool(v, startLighter); else startLighter = true; }
+            else if (key == "darker-color") { if (v) tryBool(v, startDarker); else startDarker = true; }
+            else if (key == "jump-color" || key == "j") { flagSetJump = true; if (v) tryBool(v, startJumpColor); else startJumpColor = true; }
+            else if (key == "jump-on-gradient" || key == "jumpOnGradient") { flagSetJumpGrad = true; if (v) tryBool(v, startJumpGrad); else startJumpGrad = true; }
+            else if (key == "jump-sensitivity" && v) { startJumpSens = std::atof(v); }
+            else if (key == "diff-color") { flagSetDiff = true; if (v) tryBool(v, startDiffColor); else startDiffColor = true; }
+            else if (key == "diff-sensitivity" && v) { startDiffSens = std::atof(v); }
+            else if (key == "gradient-colors" && v) { startGradColors = static_cast<size_t>(std::max(0, std::atoi(v))); }
+            else if (key == "truexy-mode" && v) { startTrueXYMode = std::atoi(v); }
+            else if (key == "truexy-lines") { flagSetTrueXYLines = true; if (v) tryBool(v, startTrueXYLines); else startTrueXYLines = true; }
+            else if (key == "analog-scope") { if (v) tryBool(v, startAnalogScope); else startAnalogScope = true; }
+            else if (key == "analog-decay" && v) { startAnalogDecay = std::atof(v); }
+            else if (key == "analog-resolution" && v) { startAnalogRes = static_cast<size_t>(std::max(64, std::atoi(v))); }
+            else if (key == "analog-lines" && v) { startAnalogLines = static_cast<size_t>(std::max(1, std::atoi(v))); }
+            else if (key == "particles" && v) { startParticles = static_cast<size_t>(std::max(1, std::atoi(v))); }
+            else if (key == "width" && v) { WINDOW_WIDTH = std::max(320, std::atoi(v)); }
+            else if (key == "height" && v) { WINDOW_HEIGHT = std::max(240, std::atoi(v)); }
+            else if (key == "capture" && v) {
+                std::string cv = v;
+                std::transform(cv.begin(), cv.end(), cv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (cv == "system" || cv == "sys" || cv == "1") startCaptureMode = 1;
+                else if (cv == "both" || cv == "2") startCaptureMode = 2;
+                else startCaptureMode = 0;
+            }
+            else if (key == "bloom-steps" && v) { startBloomSteps = std::max(1, std::atoi(v)); }
+            else if (key == "bloom-rings" && v) { startBloomRings = std::max(0, std::atoi(v)); }
+            else if (key == "bloom-ball-intensity" && v) { startBloomBallIntensity = std::atof(v); }
+            else if (key == "bloom-ball-amount" && v) { startBloomBallAmount = std::atof(v); }
+            else if (key == "window-opacity" && v) { startWindowOpacity = static_cast<float>(std::clamp(std::atof(v), 0.1, 1.0)); }
+            else if (key == "old-7") { startMode = 10; }
+            else if (key == "old-8") { startMode = 11; }
+            else if (key == "particle-size" && v) { startParticleSize = std::atof(v); }
+            else if (key == "bars-only") { flagSetBarsOnly = true; if (v) tryBool(v, startBarsOnly); else startBarsOnly = true; }
+            else if (key == "lines-only") { flagSetLinesOnly = true; if (v) tryBool(v, startLinesOnly); else startLinesOnly = true; }
+            else if (key == "particles-only") { flagSetParticlesOnly = true; if (v) tryBool(v, startParticlesOnly); else startParticlesOnly = true; }
+            else if (key == "sim-speed" && v) { startSimSpeed = std::atof(v); }
+            else if (key == "transparent-fb") { flagSetTransparentFb = true; if (v) tryBool(v, startTransparentFb); else startTransparentFb = true; }
+            else if (key == "bloom-shape" && v) {
+                std::string bsv = v;
+                std::transform(bsv.begin(), bsv.end(), bsv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (bsv == "square") startBloomShape = 1;
+                else if (bsv == "triangle") startBloomShape = 2;
+                else startBloomShape = 0;
+            }
+            else if (key == "line-smooth") { flagSetLineSmooth = true; if (v) tryBool(v, startLineSmooth); else startLineSmooth = true; }
+            else if (key == "line-sharpness" && v) { startLineSharpness = std::atof(v); }
+            else if (key == "color-mode" && v) { startColorMode = std::clamp(std::atoi(v), 0, 2); }
+            else if (key == "min-bars" && v) { startMinBars = static_cast<size_t>(std::max(1, std::atoi(v))); }
+            else if (key == "max-bars" && v) { startMaxBars = static_cast<size_t>(std::clamp(std::atoi(v), 64, 16384)); }
+            else if (key == "dense-bar-cap" && v) { startDenseBarCap = static_cast<size_t>(std::clamp(std::atoi(v), 64, 32768)); }
+            else if (key == "msaa-samples" && v) { startMSAASamples = std::clamp(std::atoi(v), 1, 8); }
+            else if (key == "control-window") { flagSetControlWindow = true; if (v) tryBool(v, startControlWindow); else startControlWindow = true; }
+            else if (key == "center-sensitivity" && v) { startCenterSensitivity = std::atof(v); }
+            else if (key == "color" && v) {
+                float r, g, b;
+                if (std::istringstream(v) >> r >> g >> b) { startColor_r = r; startColor_g = g; startColor_b = b; flagSetColor = true; }
+            }
+            else if (keyLower.size() > 14 && keyLower.substr(0, 14) == "gradientcolor" && v) {
+                float r, g, b;
+                if (std::istringstream(v) >> r >> g >> b) {
+                    size_t idx = static_cast<size_t>(std::atoi(key.c_str() + 14)) - 1;
+                    if (idx < 64) { startGradientColors[idx] = {r, g, b}; if (idx + 1 > startGradientCount) startGradientCount = idx + 1; }
+                }
+            }
+            else std::cerr << "Config: unknown token '" << key << "'\n";
         }
         file.close();
     };
@@ -719,38 +1022,210 @@ int main(int argc, char* argv[]) {
     auto writeDefaultConfig = [](const std::string& path) {
         std::ofstream out(path);
         if (!out) return false;
-        out << "# Chills Visualizer default config\n";
+        out << "# Chills Visualizer config\n";
         out << "# Lines starting with # are ignored.\n";
-        out << "# Syntax: --flag value  (same as CLI flags, value optional for booleans)\n";
+        out << "# Syntax: key = value\n";
         out << "\n";
-        out << "--mode 1\n";
-        out << "--bars 64\n";
-        out << "--sensitivity 1.0\n";
-        out << "--zoom 1.0\n";
-        out << "--wave-zoom 1.0\n";
-        out << "--wave-speed 0.0\n";
-        out << "--bloom off\n";
-        out << "--bloom-intensity 1.0\n";
-        out << "--jump-color off\n";
-        out << "--jump-sensitivity 1.0\n";
-        out << "--jump-on-gradient off\n";
-        out << "--diff-color off\n";
-        out << "--diff-sensitivity 1.0\n";
-        out << "--anti-alias off\n";
-        out << "--B-amu 2.0\n";
-        out << "--particles 256\n";
-        out << "--gradient-colors 1\n";
-        out << "--truexy-mode 0\n";
-        out << "--analog-scope off\n";
-        out << "--analog-decay 4.0\n";
-        out << "--analog-resolution 4096\n";
-        out << "--analog-lines 4096\n";
-        out << "--lighter-color off\n";
-        out << "--darker-color off\n";
-        out << "--system off\n";
-        out << "--mic off\n";
+        out << "mode = 1\n";
+        out << "bars = 64\n";
+        out << "sensitivity = 1.0\n";
+        out << "zoom = 1.0\n";
+        out << "wave-zoom = 1.0\n";
+        out << "wave-speed = 0.0\n";
+        out << "bloom = off\n";
+        out << "bloom-intensity = 1.0\n";
+        out << "jump-color = off\n";
+        out << "jump-sensitivity = 1.0\n";
+        out << "jump-on-gradient = off\n";
+        out << "diff-color = off\n";
+        out << "diff-sensitivity = 1.0\n";
+        out << "anti-alias = off\n";
+        out << "B-amu = 2.0\n";
+        out << "particles = 256\n";
+        out << "glow = on\n";
+        out << "gradient-colors = 1\n";
+        out << "truexy-mode = 0\n";
+        out << "analog-scope = off\n";
+        out << "analog-decay = 4.0\n";
+        out << "analog-resolution = 4096\n";
+        out << "analog-lines = 4096\n";
+        out << "lighter-color = off\n";
+        out << "darker-color = off\n";
+        out << "line-smooth = off\n";
+        out << "line-sharpness = 1.0\n";
+        out << "color-mode = 0\n";
+        out << "min-bars = 2\n";
+        out << "max-bars = 4096\n";
+        out << "dense-bar-cap = 8192\n";
+        out << "msaa-samples = 4\n";
+        out << "system = off\n";
+        out << "mic = off\n";
+        out << "bloom-steps = 3\n";
+        out << "bloom-rings = 3\n";
+        out << "bloom-ball-intensity = 20.0\n";
+        out << "window-opacity = 1.0\n";
+        out << "particle-size = 11.0\n";
+        out << "bars-only = off\n";
+        out << "lines-only = off\n";
+        out << "particles-only = off\n";
+        out << "color = 0.2 1.0 1.0\n";
+        out << "gradientColor1 = 1.0 0.0 0.3\n";
+        out << "sim-speed = 1.0\n";
+        out << "bloom-shape = ball\n";
+        out << "center-sensitivity = 1.0\n";
+        out << "spiral-galaxy-distance = 1.0\n";
+        out << "control-window = off\n";
+        out << "transparent-fb = off\n";
+        out << "capture = mic\n";
         return true;
     };
+
+    auto writeConfigFile = [](const std::string& path, const VisState& state, VisMode mode) {
+        std::ofstream out(path);
+        if (!out) return false;
+        auto b = [](bool v) { return v ? "on" : "off"; };
+        out << "# Chills Visualizer config\n";
+        out << "# Syntax: key = value\n";
+        out << "mode = " << static_cast<int>(mode) << "\n";
+        out << "bars = " << state.numBars << "\n";
+        out << "sensitivity = " << state.sensitivity << "\n";
+        out << "zoom = " << state.zoom << "\n";
+        out << "wave-zoom = " << state.waveZoom << "\n";
+        out << "wave-speed = " << state.waveSpeed << "\n";
+        out << "bloom = " << b(state.bloom) << "\n";
+        out << "bloom-intensity = " << state.bloomIntensity << "\n";
+        out << "B-amu = " << state.limitMultiplier << "\n";
+        out << "anti-alias = " << b(state.antiAliasing) << "\n";
+        out << "jump-color = " << b(state.jumpColor) << "\n";
+        out << "jump-on-gradient = " << b(state.jumpOnGradient) << "\n";
+        out << "jump-sensitivity = " << state.jumpSensitivity << "\n";
+        out << "diff-color = " << b(state.diffColor) << "\n";
+        out << "diff-sensitivity = " << state.diffSensitivity << "\n";
+        out << "gradient-colors = " << state.gradientColorCount << "\n";
+        out << "truexy-mode = " << static_cast<int>(state.trueXYMode) << "\n";
+        out << "analog-scope = " << b(state.analogScope) << "\n";
+        out << "particles = " << state.particleCount << "\n";
+        out << "glow = " << b(state.glow) << "\n";
+        out << "line-smooth = " << b(state.lineSmooth) << "\n";
+        out << "line-sharpness = " << state.lineSharpness << "\n";
+        out << "color-mode = " << static_cast<int>(state.colorMode) << "\n";
+        out << "min-bars = " << state.minBars << "\n";
+        out << "max-bars = " << state.maxBars << "\n";
+        out << "dense-bar-cap = " << state.denseBarCap << "\n";
+        out << "msaa-samples = " << state.msaaSamples << "\n";
+        out << "analog-decay = " << state.analogScopeDecay << "\n";
+        out << "bloom-steps = " << state.bloomSteps << "\n";
+        out << "bloom-rings = " << state.bloomRings << "\n";
+        out << "bloom-ball-intensity = " << state.bloomBallIntensity << "\n";
+        out << "bloom-ball-amount = " << state.bloomBallAmount << "\n";
+        out << "window-opacity = " << state.windowOpacity << "\n";
+        out << "particle-size = " << state.particleSize << "\n";
+        out << "bars-only = " << (state.barsOnly ? "on" : "off") << "\n";
+        out << "lines-only = " << (state.linesOnly ? "on" : "off") << "\n";
+        out << "particles-only = " << (state.particlesOnly ? "on" : "off") << "\n";
+        out << "color = " << state.randomSolid.r << " " << state.randomSolid.g << " " << state.randomSolid.b << "\n";
+        for (size_t ci = 0; ci < state.gradientColors.size(); ++ci)
+            out << "gradientColor" << (ci + 1) << " = " << state.gradientColors[ci].r << " " << state.gradientColors[ci].g << " " << state.gradientColors[ci].b << "\n";
+        out << "sim-speed = " << state.simSpeed << "\n";
+        { const char* shapes[] = {"ball","square","triangle"}; out << "bloom-shape = " << shapes[state.bloomShape] << "\n"; }
+        out << "control-window = " << (state.controlWindow ? "on" : "off") << "\n";
+        out << "transparent-fb = " << (state.transparentFb ? "on" : "off") << "\n";
+        out << "center-sensitivity = " << state.centerSensitivity << "\n";
+        out << "spiral-galaxy-distance = " << state.spiralGalaxyDistance << "\n";
+        auto capLabel = [](InputMode m) -> const char* {
+            switch (m) { case InputMode::Microphone: return "mic"; case InputMode::SystemAudio: return "system"; case InputMode::Both: return "both"; case InputMode::Reduction: return "reduction"; } return "mic";
+        };
+        out << "capture = " << capLabel(state.inputMode) << "\n";
+        return true;
+    };
+
+    auto loadLiveConfigFile = [](const std::string& path, VisState& state, VisMode& mode) {
+        std::ifstream file(path);
+        if (!file.is_open()) return;
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos || eq == 0) continue;
+            std::string key = line.substr(0, eq);
+            std::string val = line.substr(eq + 1);
+            auto tr = [](std::string& s) {
+                size_t a = s.find_first_not_of(" \t\r\n");
+                size_t b = s.find_last_not_of(" \t\r\n");
+                s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+            };
+            tr(key); tr(val);
+            if (key.empty() || val.empty()) continue;
+
+            if (key == "mode") { mode = static_cast<VisMode>(std::clamp(std::atoi(val.c_str()), 0, 15)); }
+            else if (key == "bars") { state.numBars = static_cast<size_t>(std::max(4, std::atoi(val.c_str()))); }
+            else if (key == "sensitivity") { state.sensitivity = std::atof(val.c_str()); }
+            else if (key == "zoom") { state.zoom = std::atof(val.c_str()); }
+            else if (key == "wave-zoom") { state.waveZoom = std::atof(val.c_str()); }
+            else if (key == "wave-speed") { state.waveSpeed = std::atof(val.c_str()); }
+            else if (key == "bloom") { state.bloom = val == "on" || val == "true" || val == "1"; }
+            else if (key == "bloom-intensity") { state.bloomIntensity = std::atof(val.c_str()); }
+            else if (key == "B-amu") { state.limitMultiplier = std::atof(val.c_str()); }
+            else if (key == "anti-alias") { state.antiAliasing = val == "on" || val == "true" || val == "1"; }
+            else if (key == "glow") { state.glow = val == "on" || val == "true" || val == "1"; }
+            else if (key == "jump-color") { state.jumpColor = val == "on" || val == "true" || val == "1"; }
+            else if (key == "jump-on-gradient") { state.jumpOnGradient = val == "on" || val == "true" || val == "1"; }
+            else if (key == "jump-sensitivity") { state.jumpSensitivity = std::atof(val.c_str()); }
+            else if (key == "diff-color") { state.diffColor = val == "on" || val == "true" || val == "1"; }
+            else if (key == "diff-sensitivity") { state.diffSensitivity = std::atof(val.c_str()); }
+            else if (key == "gradient-colors") { state.gradientColorCount = static_cast<size_t>(std::max(1, std::atoi(val.c_str()))); }
+            else if (key == "truexy-mode") { state.trueXYMode = static_cast<TrueXYMode>(std::clamp(std::atoi(val.c_str()), 0, 5)); }
+            else if (key == "analog-scope") { state.analogScope = val == "on" || val == "true" || val == "1"; }
+            else if (key == "particles") { state.particleCount = static_cast<size_t>(std::max(1, std::atoi(val.c_str()))); }
+            else if (key == "line-smooth") { state.lineSmooth = val == "on" || val == "true" || val == "1"; }
+            else if (key == "line-sharpness") { state.lineSharpness = std::atof(val.c_str()); }
+            else if (key == "color-mode") { state.colorMode = static_cast<ColorMode>(std::clamp(std::atoi(val.c_str()), 0, 2)); }
+            else if (key == "min-bars") { state.minBars = static_cast<size_t>(std::max(1, std::atoi(val.c_str()))); }
+            else if (key == "max-bars") { state.maxBars = static_cast<size_t>(std::clamp(std::atoi(val.c_str()), 64, 16384)); }
+            else if (key == "dense-bar-cap") { state.denseBarCap = static_cast<size_t>(std::clamp(std::atoi(val.c_str()), 64, 32768)); }
+            else if (key == "msaa-samples") { state.msaaSamples = std::clamp(std::atoi(val.c_str()), 1, 8); }
+            else if (key == "bloom-steps") { state.bloomSteps = std::max(1, std::atoi(val.c_str())); }
+            else if (key == "bloom-rings") { state.bloomRings = std::max(0, std::atoi(val.c_str())); }
+            else if (key == "bloom-ball-intensity") { state.bloomBallIntensity = std::atof(val.c_str()); }
+            else if (key == "window-opacity") { state.windowOpacity = static_cast<float>(std::clamp(std::atof(val.c_str()), 0.1, 1.0)); }
+            else if (key == "particle-size") { state.particleSize = std::atof(val.c_str()); }
+            else if (key == "bars-only") { state.barsOnly = val == "on" || val == "true" || val == "1"; }
+            else if (key == "lines-only") { state.linesOnly = val == "on" || val == "true" || val == "1"; }
+            else if (key == "particles-only") { state.particlesOnly = val == "on" || val == "true" || val == "1"; }
+            else if (key == "sim-speed") { state.simSpeed = std::atof(val.c_str()); }
+            else if (key == "bloom-shape") {
+                std::string bsv = val;
+                std::transform(bsv.begin(), bsv.end(), bsv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (bsv == "square") state.bloomShape = 1;
+                else if (bsv == "triangle") state.bloomShape = 2;
+                else state.bloomShape = 0;
+            }
+            else if (key == "center-sensitivity") { state.centerSensitivity = std::atof(val.c_str()); }
+            else if (key == "spiral-galaxy-distance") { state.spiralGalaxyDistance = std::atof(val.c_str()); }
+            else if (key == "control-window") { state.controlWindow = val == "on" || val == "true" || val == "1"; }
+            else if (key == "color") {
+                float r, g, b;
+                if (std::istringstream(val) >> r >> g >> b)
+                    state.randomSolid = {r, g, b};
+            }
+            else if (key.size() > 14 && key.substr(0, 14) == "gradientcolor") {
+                float r, g, b;
+                if (std::istringstream(val) >> r >> g >> b) {
+                    size_t idx = static_cast<size_t>(std::atoi(key.c_str() + 14)) - 1;
+                    if (idx < state.gradientColors.size()) state.gradientColors[idx] = {r, g, b};
+                }
+            }
+            else if (key == "capture") {
+                std::string cv = val;
+                std::transform(cv.begin(), cv.end(), cv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (cv == "system" || cv == "sys") state.inputMode = InputMode::SystemAudio;
+                else if (cv == "both") state.inputMode = InputMode::Both;
+                else if (cv == "reduction" || cv == "red") state.inputMode = InputMode::Reduction;
+                else state.inputMode = InputMode::Microphone;
+            }
+        }
+    };
+
     if (flagLoadConfig) {
         std::string cfgPath = defaultConfigPath();
         ensureDir(cfgPath);
@@ -767,6 +1242,14 @@ int main(int argc, char* argv[]) {
         }
         parseConfigFile(configPath);
         configSavePath = configPath;
+    }
+    // Auto-load default config if it exists and no explicit config was loaded
+    if (!flagLoadConfig && configPath.empty()) {
+        std::string autoPath = defaultConfigPath();
+        if (std::ifstream(autoPath).good()) {
+            parseConfigFile(autoPath);
+            if (configSavePath.empty()) configSavePath = autoPath;
+        }
     }
 
     for (int i = 1; i < argc; ++i) {
@@ -790,7 +1273,7 @@ int main(int argc, char* argv[]) {
 "\033[1mStartup flags:\033[0m\n"
 "  (boolean flags accept: on, off, true, false, 1, 0 — or omit for default-on)\n"
 "\n"
-"  \033[1m--mode, -m <0-9>\033[0m       Start visualization mode (0-9)\n"
+"  \033[1m--mode, -m <0-14>\033[0m      Start visualization mode (0-14, 10/11 via --old-7/--old-8)\n"
 "  \033[1m--bars <n>\033[0m             Initial bar count\n"
 "  \033[1m--sensitivity <f>\033[0m      Audio sensitivity\n"
 "  \033[1m--zoom <f>\033[0m             Zoom level\n"
@@ -813,12 +1296,25 @@ int main(int argc, char* argv[]) {
 "  \033[1m--analog-scope [on/off]\033[0m  Start in analog scope mode\n"
 "  \033[1m--analog-decay <f>\033[0m     Analog scope decay rate\n"
 "  \033[1m--analog-resolution <n>\033[0m Analog scope resolution\n"
- "  \033[1m--analog-lines <n>\033[0m     Analog scope line count\n"
- "  \033[1m--particles <n>\033[0m        Particle count for TrueXY/oscilloscope (1-4096)\n"
+  "  \033[1m--analog-lines <n>\033[0m     Analog scope line count\n"
+  "  \033[1m--particles <n>\033[0m        Particle count for TrueXY/oscilloscope (1-4096)\n"
+"  \033[1m--bars-only [on/off]\033[0m    Hide lines when fill exists (default off)\n"
+"  \033[1m--lines-only [on/off]\033[0m    Hide fill shapes (default off)\n"
+"  \033[1m--particles-only [on/off]\033[0m Show only bloom balls (oscilloscope modes exempt) (default off)\n"
 "  \033[1m--width <px>\033[0m           Window width\n"
 "  \033[1m--height <px>\033[0m          Window height\n"
-"  \033[1m--system [on/off]\033[0m       Start with system audio capture\n"
-"  \033[1m--mic [on/off]\033[0m           Start with microphone capture\n"
+"  \033[1m--capture <mode>\033[0m         Audio capture mode: mic, system, both\n"
+"  \033[1m--system [on/off]\033[0m       (legacy) Start with system audio capture\n"
+"  \033[1m--mic [on/off]\033[0m           (legacy) Start with microphone capture\n"
+"  \033[1m--control-window, -cw\033[0m    Open ImGui control panel\n"
+  "  \033[1m--no-control\033[0m             Start with control panel hidden\n"
+"  \033[1m--sim-speed <f>\033[0m         Global simulation speed multiplier (default 1.0)\n"
+"  \033[1m--bloom-shape <shape>\033[0m    Bloom ball shape: ball, square, triangle\n"
+"  \033[1m--center-sensitivity <f>\033[0m Center disc pulse sensitivity for mode 12 (default 1.0)\n"
+"  \033[1m--bloom-steps <n>\033[0m       Bloom balls per bar (1-20, default 3)\n"
+"  \033[1m--bloom-rings <n>\033[0m       Concentric rings per bloom ball (0-400, default 3)\n"
+"  \033[1m--bloom-ball-intensity <f>\033[0m Bloom ball size (1-600, default 20)\n"
+"  \033[1m--window-opacity <f>\033[0m    Window opacity 0.1-1.0 (default 1.0)\n"
 "\n";
             return 0;
         }
@@ -829,15 +1325,17 @@ int main(int argc, char* argv[]) {
 "\n"
 "\033[1mModes (number keys 0-9):\033[0m\n"
 "  0  TrueXY          XY Lissajous display of stereo channels\n"
-"  1  Oscilloscope    scrolling waveform\n"
+"  1  Mirrored Dense  mirrored bars from center (cava-style)\n"
 "  2  Spectrum Bars   frequency spectrum bar graph\n"
 "  3  Mirrored        mirrored waveform (top/bottom)\n"
 "  4  Circular        radial spectrum\n"
 "  5  Circular Filled radial spectrum with filled bands\n"
 "  6  Circular Wave   circular waveform\n"
 "  7  Filled Wave     filled waveform\n"
-"  8  Bars Filled     filled bar spectrum\n"
+"  8  Circular Mesh  continuous circular mesh\n"
 "  9  Bars Circular   circular bar spectrum\n"
+"  12 Circular Fill  filled bar spectrum (old mode 8)\n"
+"  13 Mirrored Dense mirrored dense spectrum\n"
 "\n"
 "\033[1mGlobal keys:\033[0m\n"
 "  \033[1mH\033[0m          Analog scope mode (P31 phosphor emulation)\n"
@@ -864,12 +1362,16 @@ int main(int argc, char* argv[]) {
 "  \033[1mESC\033[0m        Quit\n"
 "\n"
 "\033[1mStartup flags (--help for full list, boolean flags accept on/off):\033[0m\n"
-"  \033[1m--mode, -m <0-9>\033[0m       --bars <n>       \033[1m--sensitivity <f>\033[0m\n"
+"  \033[1m--mode, -m <0-14>\033[0m      --bars <n>       \033[1m--sensitivity <f>\033[0m\n"
+"  \033[1m--old-7\033[0m                 --old-8          \033[1m--particle-size <f>\033[0m\n"
 "  \033[1m--zoom <f>\033[0m             --wave-zoom <f>  \033[1m--wave-speed <f>\033[0m\n"
- "  \033[1m--bloom, -b\033[0m             --jump-color, -j \033[1m--diff-color\033[0m     \033[1m--jump-on-gradient\033[0m\n"
- "  \033[1m--particles <n>\033[0m         --system\033[0m               --lighter-color  \033[1m--darker-color\033[0m\n"
- "  \033[1m--LoadConfig\033[0m            Config:  ~/.config/visualizer/visualizer.config (Linux)\n"
- "                       \033[1m\033[0m              or  %%APPDATA%%\\visualizer\\visualizer.config (Windows)\n"
+"  \033[1m--bloom, -b\033[0m             --jump-color, -j \033[1m--diff-color\033[0m     \033[1m--jump-on-gradient\033[0m\n"
+"  \033[1m--particles <n>\033[0m         --capture <mode>\033[0m      --bars-only \033[1m--lines-only\033[0m\n"
+"  \033[1m--particles-only\033[0m        --sim-speed <f>  \033[1m--bloom-shape ball|square|triangle\033[0m\n"
+"  \033[1m--center-sensitivity <f>\033[0m --control-window  \033[1m--lighter-color\033[0m  \033[1m--no-control\033[0m\n"
+"  \033[1m--bloom-steps\033[0m           --bloom-rings   \033[1m--bloom-ball-intensity\033[0m   --window-opacity\n"
+"  \033[1m--LoadConfig\033[0m            Config:  ~/.config/visualizer/visualizer.config (Linux)\n"
+"                       \033[1m\033[0m              or  %%APPDATA%%\\visualizer\\visualizer.config (Windows)\n"
 "\n";
             return 0;
         }
@@ -2056,6 +2558,11 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
       The glow pass accumulates brightness: overlapping glow quads
       create brighter spots, mimicking optical bloom.
 
+    tipVertices: Bloom ball point vertices [x,y,r,g,b,size] for GL_POINTS.
+      Each vertex is a glowing bead along a bar (bar modes) or radially
+      (circular modes). Size = bloomBallIntensity * barHeight. Drawn with
+      additive blending and concentric ring support via uBloomRings.
+
   Lines 32-42: Builder function declarations
     Each builder takes audio data + VisState and returns ModeOutput.
     Some take additional parameters:
@@ -2097,15 +2604,21 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     bloom, bloomIntensity, bloomSize (34-36): Bloom parameters.
       bloomSize controls how far the glow spreads (used in appendBarGlow).
     
-    antiAliasing (38): MSAA toggle.
-    inputMode (39): Current audio input source.
+    bloomSteps (37): Number of bloom ball steps per bar (default 3).
+    bloomRings (38): Concentric rings per bloom ball (default 3).
+    bloomBallIntensity (39): Bloom ball point size multiplier (default 20).
     
-    trueXYMode, trueXYLines (40-41): TrueXY sub-mode and line overlay toggle.
+    antiAliasing (41): MSAA toggle.
+    inputMode (42): Current audio input source.
     
-    analogScope, analogScopeMode (42-43): Analog scope on/off and sub-mode.
-    analogScopeDecay (44): Phosphor decay rate. Default 4.0.
-    analogResolution (45): Number of raw samples for analog scope. Default 4096.
-    analogLineCount (46): Number of trace samples. Default 4096.
+    trueXYMode, trueXYLines (43-44): TrueXY sub-mode and line overlay toggle.
+    
+    analogScope, analogScopeMode (45-46): Analog scope on/off and sub-mode.
+    analogScopeDecay (47): Phosphor decay rate. Default 4.0.
+    analogResolution (48): Number of raw samples for analog scope. Default 4096.
+    analogLineCount (49): Number of trace samples. Default 4096.
+    
+    windowOpacity (64): Window opacity 0.1-1.0. Default 1.0.
 
 ================================================================================
    FILE 5: vis_state.cpp  (43 lines)
@@ -2609,9 +3122,15 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
 
         // --- Startup config flags ---
         if (arg == "--mode" || arg == "-m") {
-            if (++i >= argc) { std::cerr << "--mode requires 0-9\n"; return 1; }
+            if (++i >= argc) { std::cerr << "--mode requires 0-14\n"; return 1; }
             startMode = std::atoi(argv[i]);
-            if (startMode < 0 || startMode > 9) { std::cerr << "--mode must be 0-9\n"; return 1; }
+            if (startMode < 0 || startMode > 14) { std::cerr << "--mode must be 0-14\n"; return 1; }
+        }
+        if (arg == "--old-7") { startMode = 10; continue; }
+        if (arg == "--old-8") { startMode = 11; continue; }
+        if (arg == "--particle-size") {
+            if (++i >= argc) { std::cerr << "--particle-size requires a number\n"; return 1; }
+            startParticleSize = std::atof(argv[i]);
             continue;
         }
         if (arg == "--bars") {
@@ -2651,14 +3170,24 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             if (i + 1 < argc && tryBool(argv[i + 1], startJumpColor)) { ++i; }
             continue;
         }
+        if (arg == "--capture" || arg == "--capture-mode") {
+            if (++i >= argc) { std::cerr << "--capture requires mic/system/both/reduction\n"; return 1; }
+            std::string cv = argv[i];
+            std::transform(cv.begin(), cv.end(), cv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (cv == "system" || cv == "sys") startCaptureMode = 1;
+            else if (cv == "both") startCaptureMode = 2;
+            else if (cv == "reduction" || cv == "red") startCaptureMode = 3;
+            else startCaptureMode = 0;
+            continue;
+        }
         if (arg == "--system") {
-            startSystem = true;
-            if (i + 1 < argc && tryBool(argv[i + 1], startSystem)) { ++i; }
+            startCaptureMode = 1;
+            if (i + 1 < argc) { std::string nv = argv[i+1]; std::transform(nv.begin(), nv.end(), nv.begin(), [](unsigned char c){return static_cast<char>(std::tolower(c));}); if (nv == "off" || nv == "0" || nv == "false") startCaptureMode = -1; else ++i; }
             continue;
         }
         if (arg == "--mic") {
-            startMic = true;
-            if (i + 1 < argc && tryBool(argv[i + 1], startMic)) { ++i; }
+            startCaptureMode = 0;
+            if (i + 1 < argc) { std::string nv = argv[i+1]; std::transform(nv.begin(), nv.end(), nv.begin(), [](unsigned char c){return static_cast<char>(std::tolower(c));}); if (nv == "off" || nv == "0" || nv == "false") startCaptureMode = -1; else ++i; }
             continue;
         }
         if (arg == "--wave-zoom") {
@@ -2680,6 +3209,12 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             flagSetAA = true;
             startAntiAlias = true;
             if (i + 1 < argc && tryBool(argv[i + 1], startAntiAlias)) { ++i; }
+            continue;
+        }
+        if (arg == "--glow") {
+            flagSetGlow = true;
+            startGlow = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startGlow)) { ++i; }
             continue;
         }
         if (arg == "--jump-sensitivity") {
@@ -2764,6 +3299,74 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         if (arg == "--LoadConfig") { continue; }
         if (arg == "--Config") { ++i; continue; }
         if (arg == "--tui" || arg == "--tui-only") { tuiOnly = true; continue; }
+        if (arg == "--control-window" || arg == "-cw") { controlWindow = true; continue; }
+        if (arg == "--no-control") { controlWindow = false; continue; }
+        if (arg == "--bloom-steps") {
+            if (++i >= argc) { std::cerr << "--bloom-steps requires a number\n"; return 1; }
+            startBloomSteps = std::max(1, std::atoi(argv[i]));
+            continue;
+        }
+        if (arg == "--bloom-rings") {
+            if (++i >= argc) { std::cerr << "--bloom-rings requires a number\n"; return 1; }
+            startBloomRings = std::max(0, std::atoi(argv[i]));
+            continue;
+        }
+        if (arg == "--bloom-ball-intensity") {
+            if (++i >= argc) { std::cerr << "--bloom-ball-intensity requires a number\n"; return 1; }
+            startBloomBallIntensity = static_cast<float>(std::max(1.0, std::atof(argv[i])));
+            continue;
+        }
+        if (arg == "--window-opacity") {
+            if (++i >= argc) { std::cerr << "--window-opacity requires a number\n"; return 1; }
+            startWindowOpacity = static_cast<float>(std::clamp(std::atof(argv[i]), 0.1, 1.0));
+            continue;
+        }
+        if (arg == "--bars-only") {
+            flagSetBarsOnly = true;
+            startBarsOnly = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startBarsOnly)) { ++i; }
+            continue;
+        }
+        if (arg == "--lines-only") {
+            flagSetLinesOnly = true;
+            startLinesOnly = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startLinesOnly)) { ++i; }
+            continue;
+        }
+        if (arg == "--particles-only") {
+            flagSetParticlesOnly = true;
+            startParticlesOnly = true;
+            if (i + 1 < argc && tryBool(argv[i + 1], startParticlesOnly)) { ++i; }
+            continue;
+        }
+        if (arg == "--sim-speed") {
+            if (++i >= argc) { std::cerr << "--sim-speed requires a number\n"; return 1; }
+            startSimSpeed = std::atof(argv[i]);
+            continue;
+        }
+        if (arg == "--bloom-shape") {
+            if (++i >= argc) { std::cerr << "--bloom-shape requires ball|square|triangle\n"; return 1; }
+            std::string bsv = argv[i];
+            std::transform(bsv.begin(), bsv.end(), bsv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (bsv == "square") startBloomShape = 1;
+            else if (bsv == "triangle") startBloomShape = 2;
+            else startBloomShape = 0;
+            continue;
+        }
+        if (arg == "--center-sensitivity") {
+            if (++i >= argc) { std::cerr << "--center-sensitivity requires a number\n"; return 1; }
+            startCenterSensitivity = std::atof(argv[i]);
+            continue;
+        }
+    }
+
+    // Ensure configSavePath is always set and config file exists
+    if (configSavePath.empty()) {
+        configSavePath = defaultConfigPath();
+        ensureDir(configSavePath);
+        if (!std::ifstream(configSavePath).good()) {
+            writeDefaultConfig(configSavePath);
+        }
     }
 
     // ── TUI-only config editor mode (no graphics) ──
@@ -2773,7 +3376,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         if (!std::ifstream(cfgPath).good()) writeDefaultConfig(cfgPath);
         VisState tuiState;
         VisMode tuiMode = VisMode::Oscilloscope;
-        int tuiSel = -1;
+        int tuiSel = 0;
         int tw = 80, th = 24;
 #ifndef _WIN32
         struct winsize ws;
@@ -2790,7 +3393,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
                 if (!(iss >> tok)) continue;
                 std::getline(iss >> std::ws, val);
                 const char* v = val.empty() ? nullptr : val.c_str();
-                if (tok == "--mode" && v) tuiMode = static_cast<VisMode>(std::max(0, std::min(9, std::atoi(v))));
+                if (tok == "--mode" && v) tuiMode = static_cast<VisMode>(std::max(0, std::min(15, std::atoi(v))));
                 else if (tok == "--bars" && v) tuiState.numBars = static_cast<size_t>(std::max(4, std::atoi(v)));
                 else if (tok == "--sensitivity" && v) tuiState.sensitivity = std::atof(v);
                 else if (tok == "--zoom" && v) tuiState.zoom = std::atof(v);
@@ -2809,53 +3412,132 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
                 else if (tok == "--truexy-mode" && v) tuiState.trueXYMode = static_cast<TrueXYMode>(std::max(0, std::min(5, std::atoi(v))));
                 else if (tok == "--analog-scope" && v) tuiState.analogScope = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
                 else if (tok == "--particles" && v) tuiState.particleCount = static_cast<size_t>(std::max(1, std::atoi(v)));
+                else if (tok == "--glow" && v) tuiState.glow = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--bars-only" && v) tuiState.barsOnly = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--lines-only" && v) tuiState.linesOnly = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--particles-only" && v) tuiState.particlesOnly = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--sim-speed" && v) tuiState.simSpeed = std::atof(v);
+                else if (tok == "--bloom-shape" && v) {
+                    std::string bsv = v;
+                    std::transform(bsv.begin(), bsv.end(), bsv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (bsv == "square") tuiState.bloomShape = 1;
+                    else if (bsv == "triangle") tuiState.bloomShape = 2;
+                    else tuiState.bloomShape = 0;
+                }
+                else if (tok == "--center-sensitivity" && v) tuiState.centerSensitivity = std::atof(v);
+                else if (tok == "--control-window" && v) tuiState.controlWindow = std::string(v) == "on" || std::string(v) == "true" || std::string(v) == "1";
+                else if (tok == "--color" && v) {
+                    float r, g, b;
+                    if (std::istringstream(v) >> r >> g >> b) tuiState.randomSolid = {r, g, b};
+                }
+                else if (tok.size() > 16 && tok.substr(0, 16) == "--gradient-color-" && v) {
+                    float r, g, b;
+                    if (std::istringstream(v) >> r >> g >> b) {
+                        size_t idx = static_cast<size_t>(std::atoi(tok.c_str() + 16)) - 1;
+                        if (idx < tuiState.gradientColors.size()) tuiState.gradientColors[idx] = {r, g, b};
+                    }
+                }
+                else if (tok == "--particle-size" && v) tuiState.particleSize = std::atof(v);
+                else if (tok == "--capture" && v) {
+                    std::string cv = v;
+                    std::transform(cv.begin(), cv.end(), cv.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    if (cv == "system" || cv == "sys") tuiState.inputMode = InputMode::SystemAudio;
+                    else if (cv == "both") tuiState.inputMode = InputMode::Both;
+                    else if (cv == "reduction" || cv == "red") tuiState.inputMode = InputMode::Reduction;
+                    else tuiState.inputMode = InputMode::Microphone;
+                }
             }
         };
+        static time_t tuiLastMtime = 0;
         auto tuiSave = [&]() {
-            std::ofstream out(cfgPath);
-            if (!out) return;
-            auto b = [](bool v) { return v ? "on" : "off"; };
-            out << "# Chills Visualizer config\n";
-            out << "--mode " << static_cast<int>(tuiMode) << "\n";
-            out << "--bars " << tuiState.numBars << "\n";
-            out << "--sensitivity " << tuiState.sensitivity << "\n";
-            out << "--zoom " << tuiState.zoom << "\n";
-            out << "--wave-zoom " << tuiState.waveZoom << "\n";
-            out << "--wave-speed " << tuiState.waveSpeed << "\n";
-            out << "--bloom " << b(tuiState.bloom) << "\n";
-            out << "--bloom-intensity " << tuiState.bloomIntensity << "\n";
-            out << "--B-amu " << tuiState.limitMultiplier << "\n";
-            out << "--anti-alias " << b(tuiState.antiAliasing) << "\n";
-            out << "--jump-color " << b(tuiState.jumpColor) << "\n";
-            out << "--jump-on-gradient " << b(tuiState.jumpOnGradient) << "\n";
-            out << "--jump-sensitivity " << tuiState.jumpSensitivity << "\n";
-            out << "--diff-color " << b(tuiState.diffColor) << "\n";
-            out << "--diff-sensitivity " << tuiState.diffSensitivity << "\n";
-            out << "--gradient-colors " << tuiState.gradientColorCount << "\n";
-            out << "--truexy-mode " << static_cast<int>(tuiState.trueXYMode) << "\n";
-            out << "--analog-scope " << b(tuiState.analogScope) << "\n";
-            out << "--particles " << tuiState.particleCount << "\n";
-            out << std::flush;
+            writeConfigFile(cfgPath, tuiState, tuiMode);
+            struct stat r;
+            if (stat(cfgPath.c_str(), &r) == 0) {
+                tuiLastMtime = r.st_mtime;
+            }
         };
+        
+        auto tuiSetMode = [&](VisMode m) {
+            tuiMode = m;
+            if (tuiMode == VisMode::ParticleField) {
+                tuiState.bloomSteps = 12; tuiState.bloomRings = 0; tuiState.bloom = true;
+                tuiState.bloomShape = 0; tuiState.bloomBallIntensity = 40.0f;
+            }
+        };
+        auto adjust_param = [&](int idx, int delta) {
+            auto a = [&](float& v, float s, float mn, float mx) { v = std::clamp(v + static_cast<float>(delta) * s, mn, mx); };
+            switch (idx) {
+                case 0: tuiSetMode(static_cast<VisMode>((static_cast<int>(tuiMode) + delta + 15) % 15)); break;
+                case 1: tuiState.numBars = static_cast<size_t>(std::clamp(static_cast<int>(tuiState.numBars) + delta * 4, 4, 512)); break;
+                case 2: a(tuiState.sensitivity, 0.1f, 0.1f, 10.0f); break;
+                case 3: a(tuiState.zoom, 0.1f, 0.3f, 5.0f); break;
+                case 4: a(tuiState.waveZoom, 0.1f, 0.1f, 10.0f); break;
+                case 5: a(tuiState.waveSpeed, 0.1f, 0.0f, 20.0f); break;
+                case 6: tuiState.trueXYMode = static_cast<TrueXYMode>((static_cast<int>(tuiState.trueXYMode) + delta + 6) % 6); break;
+                case 7: tuiState.analogScope = !tuiState.analogScope; break;
+                case 8: a(tuiState.lineSharpness, 0.25f, 0.25f, 5.0f); break;
+                case 9: a(tuiState.bloomIntensity, 0.1f, 0.5f, 2.5f); break;
+                case 10: tuiState.glow = !tuiState.glow; break;
+                case 11: a(tuiState.jumpSensitivity, 0.25f, 0.25f, 5.0f); break;
+                case 13: a(tuiState.diffSensitivity, 0.25f, 0.25f, 5.0f); break;
+                case 14: a(tuiState.limitMultiplier, 0.5f, 0.5f, 10.0f); break;
+                case 15: tuiState.gradientColorCount = static_cast<size_t>(std::clamp(static_cast<int>(tuiState.gradientColorCount) + delta, 1, 64)); break;
+            }
+            tuiSave();
+        };
+
+        auto toggle_param = [&](int idx) {
+            switch (idx) {
+                case 0: tuiSetMode(static_cast<VisMode>((static_cast<int>(tuiMode) + 1) % 15)); break;
+                case 6: tuiState.trueXYMode = static_cast<TrueXYMode>((static_cast<int>(tuiState.trueXYMode) + 1) % 6); break;
+                case 7: tuiState.analogScope = !tuiState.analogScope; break;
+                case 8: tuiState.lineSmooth = !tuiState.lineSmooth; break;
+                case 9: tuiState.bloom = !tuiState.bloom; break;
+                case 10: tuiState.antiAliasing = !tuiState.antiAliasing; break;
+                case 11: tuiState.jumpColor = !tuiState.jumpColor; break;
+                case 12: tuiState.jumpOnGradient = !tuiState.jumpOnGradient; break;
+                case 13: tuiState.diffColor = !tuiState.diffColor; break;
+                case 15: tuiState.colorMode = static_cast<ColorMode>((static_cast<int>(tuiState.colorMode) + 1) % 3); break;
+            }
+            tuiSave();
+        };
+
         tuiReload();
         // Enter alt screen + hide cursor + enable mouse
         std::cout << "\033[?1047h\033[2J\033[H\033[?25l\033[?1000h\033[?1006h\033[0m";
         bool tuiRunning = true;
         double lastFrameTime = 0.0;
+        TuiRendererLocal renderer;
+
         while (tuiRunning) {
             double now = 0.0;
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             now = static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+            struct stat tuiStatResult;
+            if (stat(cfgPath.c_str(), &tuiStatResult) == 0) {
+                if (tuiLastMtime == 0) {
+                    tuiLastMtime = tuiStatResult.st_mtime;
+                } else if (tuiStatResult.st_mtime != tuiLastMtime) {
+                    tuiLastMtime = tuiStatResult.st_mtime;
+                    tuiReload();
+                }
+            }
+
 #ifndef _WIN32
             // Terminal resize check
             if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) { tw = ws.ws_col; th = ws.ws_row; }
 #endif
-            if (tw < 60 || th < 12) {
+            if (tw < 60 || th < 15) {
                 std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l"
-                    "\033[1;31mTerminal too small\033[0m\n";
+                    "\033[1;31mTerminal too small. Please resize!\033[0m\n";
                 break;
             }
+            
+            if (tw != renderer.width || th != renderer.height) {
+                renderer.resize(tw, th);
+            }
+
             // Stdin polling for mouse
 #ifndef _WIN32
             {
@@ -2871,28 +3553,21 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
                             int btn = 0, cx = 0, cy = 0;
                             char endc = 0;
                             if (sscanf(p + 2, "%d;%d;%d%c", &btn, &cx, &cy, &endc) >= 3) {
-                                int paramIdx = cy - 2;
                                 if (btn == 0 && (endc == 'M' || endc == 'm')) {
-                                    if (paramIdx >= 0 && paramIdx <= 15 && endc == 'M')
-                                        tuiSel = (tuiSel == paramIdx) ? -1 : paramIdx;
+                                    if (endc == 'M') {
+                                        int row_idx = cy - 3;
+                                        if (row_idx >= 0 && row_idx <= 8) {
+                                            if (cx < tw / 2) {
+                                                tuiSel = row_idx;
+                                            } else if (row_idx <= 6) {
+                                                tuiSel = 9 + row_idx;
+                                            }
+                                        }
+                                    }
                                 } else if (btn == 64 || btn == 65) {
                                     int delta = (btn == 64) ? 1 : -1;
                                     if (tuiSel >= 0) {
-                                        auto a = [&](float& v, float s, float mn, float mx) { v = std::clamp(v + static_cast<float>(delta) * s, mn, mx); };
-                                        switch (tuiSel) {
-                                            case 1: tuiState.numBars = static_cast<size_t>(std::clamp(static_cast<int>(tuiState.numBars) + delta * 4, 4, 512)); break;
-                                            case 2: a(tuiState.sensitivity, 0.1f, 0.1f, 10.0f); break;
-                                            case 3: a(tuiState.zoom, 0.1f, 0.3f, 5.0f); break;
-                                            case 4: a(tuiState.waveZoom, 0.1f, 0.1f, 10.0f); break;
-                                            case 5: a(tuiState.waveSpeed, 0.1f, 0.0f, 20.0f); break;
-                                            case 6: a(tuiState.bloomIntensity, 0.5f, 0.5f, 2.5f); break;
-                                            case 8: a(tuiState.jumpSensitivity, 0.25f, 0.25f, 5.0f); break;
-                                            case 10: a(tuiState.diffSensitivity, 0.25f, 0.25f, 5.0f); break;
-                                            case 11: a(tuiState.limitMultiplier, 0.5f, 0.5f, 10.0f); break;
-                                            case 13: tuiState.gradientColorCount = static_cast<size_t>(std::clamp(static_cast<int>(tuiState.gradientColorCount) + delta, 1, 64)); break;
-                                            case 15: a(tuiState.lineSharpness, 0.25f, 0.25f, 5.0f); break;
-                                        }
-                                        tuiSave();
+                                        adjust_param(tuiSel, delta);
                                     }
                                 }
                             }
@@ -2919,62 +3594,15 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
                         if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
                             if (seq[0] == '[') {
                                 switch (seq[1]) {
-                                    case 'A': tuiSel = std::max(-1, tuiSel - 1); break;
-                                    case 'B': tuiSel = std::min(15, tuiSel + 1); break;
-                                    case 'C': // right
-                                        if (tuiSel >= 0) {
-                                            switch (tuiSel) {
-                                                case 1: tuiState.numBars = std::min<size_t>(512, tuiState.numBars + 4); break;
-                                                case 2: tuiState.sensitivity = std::min(10.0f, tuiState.sensitivity + 0.1f); break;
-                                                case 3: tuiState.zoom = std::min(5.0f, tuiState.zoom + 0.1f); break;
-                                                case 4: tuiState.waveZoom = std::min(10.0f, tuiState.waveZoom + 0.1f); break;
-                                                case 5: tuiState.waveSpeed = std::min(20.0f, tuiState.waveSpeed + 0.1f); break;
-                                                case 6: tuiState.bloomIntensity = std::min(2.5f, tuiState.bloomIntensity + 0.5f); break;
-                                                case 8: tuiState.jumpSensitivity = std::min(5.0f, tuiState.jumpSensitivity + 0.25f); break;
-                                                case 10: tuiState.diffSensitivity = std::min(5.0f, tuiState.diffSensitivity + 0.25f); break;
-                                                case 11: tuiState.limitMultiplier = std::min(10.0f, tuiState.limitMultiplier + 0.5f); break;
-                                                case 13: tuiState.gradientColorCount = std::min<size_t>(64, tuiState.gradientColorCount + 1); break;
-                                                case 15: tuiState.lineSharpness = std::min(5.0f, tuiState.lineSharpness + 0.25f); break;
-                                            }
-                                            tuiSave();
-                                        }
-                                        break;
-                                    case 'D': // left
-                                        if (tuiSel >= 0) {
-                                            switch (tuiSel) {
-                                                case 1: tuiState.numBars = std::max<size_t>(4, tuiState.numBars - 4); break;
-                                                case 2: tuiState.sensitivity = std::max(0.1f, tuiState.sensitivity - 0.1f); break;
-                                                case 3: tuiState.zoom = std::max(0.3f, tuiState.zoom - 0.1f); break;
-                                                case 4: tuiState.waveZoom = std::max(0.1f, tuiState.waveZoom - 0.1f); break;
-                                                case 5: tuiState.waveSpeed = std::max(0.0f, tuiState.waveSpeed - 0.1f); break;
-                                                case 6: tuiState.bloomIntensity = std::max(0.5f, tuiState.bloomIntensity - 0.5f); break;
-                                                case 8: tuiState.jumpSensitivity = std::max(0.25f, tuiState.jumpSensitivity - 0.25f); break;
-                                                case 10: tuiState.diffSensitivity = std::max(0.25f, tuiState.diffSensitivity - 0.25f); break;
-                                                case 11: tuiState.limitMultiplier = std::max(0.5f, tuiState.limitMultiplier - 0.5f); break;
-                                                case 13: tuiState.gradientColorCount = std::max<size_t>(1, tuiState.gradientColorCount - 1); break;
-                                                case 15: tuiState.lineSharpness = std::max(0.25f, tuiState.lineSharpness - 0.25f); break;
-                                            }
-                                            tuiSave();
-                                        }
-                                        break;
+                                    case 'A': tuiSel = (tuiSel == 0) ? 15 : tuiSel - 1; break;
+                                    case 'B': tuiSel = (tuiSel + 1) % 16; break;
+                                    case 'C': adjust_param(tuiSel, 1); break;
+                                    case 'D': adjust_param(tuiSel, -1); break;
                                 }
                             }
                         }
                     } else if (k == '\n' || k == '\r') {
-                        if (tuiSel >= 0) {
-                            switch (tuiSel) {
-                                case 0: tuiMode = static_cast<VisMode>((static_cast<int>(tuiMode) + 1) % 10); break;
-                                case 6: tuiState.bloom = !tuiState.bloom; break;
-                                case 7: tuiState.antiAliasing = !tuiState.antiAliasing; break;
-                                case 8: tuiState.jumpColor = !tuiState.jumpColor; break;
-                                case 9: tuiState.jumpOnGradient = !tuiState.jumpOnGradient; break;
-                                case 10: tuiState.diffColor = !tuiState.diffColor; break;
-                                case 12: tuiState.trueXYMode = static_cast<TrueXYMode>((static_cast<int>(tuiState.trueXYMode) + 1) % 6); break;
-                                case 14: tuiState.analogScope = !tuiState.analogScope; break;
-                                case 15: tuiState.lineSmooth = !tuiState.lineSmooth; break;
-                            }
-                            tuiSave();
-                        }
+                        toggle_param(tuiSel);
                     } else if (k == 'q' || k == 27 /* Esc */) {
                         tuiRunning = false;
                     }
@@ -2982,94 +3610,356 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
                 tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
             }
 #endif
-            // Render TUI (throttled to ~5 FPS)
-            if (now - lastFrameTime >= 0.2) {
+            // Render TUI (throttled to ~10 FPS for animations)
+            if (now - lastFrameTime >= 0.1) {
                 lastFrameTime = now;
+                renderer.clear();
+
                 int hh = static_cast<int>(now) / 3600;
                 int mm = (static_cast<int>(now) % 3600) / 60;
                 int ss = static_cast<int>(now) % 60;
-                auto tag = [](bool v) { return v ? "\033[32m\xe2\x97\x8f\033[0m" : "\033[90m\xe2\x97\x8b\033[0m"; };
+                char time_buf[64];
+                snprintf(time_buf, sizeof(time_buf), " %02d:%02d:%02d ", hh, mm, ss);
+
                 auto xym = [](TrueXYMode m) {
-                    switch (m) { case TrueXYMode::Scatter: return "Scat"; case TrueXYMode::LineStrip: return "Line";
+                    switch (m) { case TrueXYMode::Scatter: return "Scatter"; case TrueXYMode::LineStrip: return "Line";
                     case TrueXYMode::Both: return "Both"; case TrueXYMode::FilledTrail: return "Fill";
                     case TrueXYMode::GlowScatter: return "Glow"; case TrueXYMode::PhosphorTrail: return "Phos"; } return "?";
                 };
                 auto cm = [](ColorMode m) {
-                    switch (m) { case ColorMode::Normal: return "Nrm"; case ColorMode::RandomSolid: return "Sol";
-                    case ColorMode::RandomGradient: return "Grd"; } return "?";
+                    switch (m) { case ColorMode::Normal: return "Normal"; case ColorMode::RandomSolid: return "Solid";
+                    case ColorMode::RandomGradient: return "Gradient"; } return "?";
                 };
                 auto mn = [](VisMode m) {
-                    switch (m) { case VisMode::TrueXY: return "XY"; case VisMode::Oscilloscope: return "Osc";
-                    case VisMode::SpectrumBars: return "Bar"; case VisMode::MirroredWaveform: return "Mir";
-                    case VisMode::CircularOscilloscope: return "COs"; case VisMode::CircularSpectrum: return "CSp";
-                    case VisMode::Lissajous: return "Lis"; case VisMode::DenseSpectrum: return "Den";
-                    case VisMode::CircularSpectrumFilled: return "CFi"; case VisMode::PulseRings: return "Pls"; } return "?";
+                    switch (m) { case VisMode::TrueXY: return "XY"; case VisMode::Oscilloscope: return "Oscilloscope";
+                    case VisMode::SpectrumBars: return "Spectrum Bars"; case VisMode::MirroredWaveform: return "Mirrored";
+                    case VisMode::CircularOscilloscope: return "Circular Osc"; case VisMode::CircularSpectrum: return "Circular Spec";
+                    case VisMode::Lissajous: return "Lissajous"; case VisMode::DenseSpectrum: return "Dense Spec";
+                    case VisMode::CircularMesh: return "Circular Mesh"; case VisMode::PulseRings: return "Pulse Rings";
+                    case VisMode::ParticleField: return "Spiral Galaxy"; case VisMode::LedBars: return "LED Bars";
+                    case VisMode::CircularSpectrumFilled: return "Circular Fill";
+                    case VisMode::DenseSpectrumMirrored: return "Mirrored Dense";
+                    case VisMode::OscilloscopeLegacy: return "Osc (Legacy)"; } return "?";
                 };
-                std::cout << "\033[1;1H";
-                // Title bar
-                std::cout << "\033[1;36m\xe2\x95\x8e\xe2\x95\x90\xe2\x95\x90"
-                    " \033[1;37mChills Config\033[1;36m \xe2\x95\x90"
-                    << " " << mn(tuiMode) << " [" << int(tuiMode) << "]"
-                    << " \xe2\x95\x90 " << (hh < 10 ? "0" : "") << hh << ":"
-                    << (mm < 10 ? "0" : "") << mm << ":" << (ss < 10 ? "0" : "") << ss
-                    << " \xe2\x95\x90 Config Editor\033[1;36m";
-                for (int i = 0; i < tw - 47; ++i) std::cout << "\xe2\x95\x90";
-                std::cout << "\xe2\x95\x8f\033[0m\n";
-                // Params
-                auto pRow = [&](int idx, const char* label, const std::string& val, bool sel) {
-                    if (sel) std::cout << "\033[48;5;236m";
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m"
-                              << (sel ? "\033[48;5;236m\033[1;97m" : "\033[1m") << label;
-                    if (sel) std::cout << "\033[48;5;236m\033[0m\033[48;5;236m";
-                    else std::cout << "\033[0m";
-                    std::cout << " " << val;
-                    int used = 3 + static_cast<int>(strlen(label)) + 1 + static_cast<int>(val.size());
-                    if (sel) std::cout << "\033[48;5;236m";
-                    for (int i = used; i < tw - 3; ++i) std::cout << " ";
-                    if (sel) std::cout << "\033[0m";
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
+
+                // Draw panels
+                int left_box_w = tw / 2 - 1;
+                int right_box_x = left_box_w + 2;
+                int right_box_w = tw - right_box_x;
+
+                renderer.draw_box(0, 1, left_box_w, 11, " VISUALIZER SETTINGS ", TuiRendererLocal::BORDER, TuiRendererLocal::TEAL);
+                renderer.draw_box(right_box_x - 1, 1, right_box_w, 11, " EFFECTS & STYLING ", TuiRendererLocal::BORDER, TuiRendererLocal::CYAN);
+
+                // Top status bar
+                std::string top_bar(tw, ' ');
+                renderer.draw_string(0, 0, top_bar, TuiRendererLocal::TEXT_WHITE, false, TuiRendererLocal::BORDER, true);
+                renderer.draw_string(2, 0, "CHILLS VISUALIZER CONFIG EDITOR", TuiRendererLocal::TEXT_WHITE, true, TuiRendererLocal::BORDER, true);
+                renderer.draw_string(tw - 12, 0, time_buf, TuiRendererLocal::TEAL, true, TuiRendererLocal::BORDER, true);
+
+                // Row drawer helper
+                auto draw_row = [&](int idx, int col, int row, const std::string& label, const std::string& val, double pct = -1.0) {
+                    bool sel = (tuiSel == idx);
+                    int target_x = (col == 0) ? 2 : right_box_x + 1;
+                    int max_w = (col == 0) ? left_box_w - 4 : right_box_w - 4;
+                    
+                    Color row_bg = sel ? TuiRendererLocal::BORDER : TuiRendererLocal::BG_DARK;
+                    
+                    for (int xo = 0; xo < max_w; ++xo) {
+                        renderer.draw_cell(target_x + xo, 2 + row, " ", TuiRendererLocal::TEXT_WHITE, true, row_bg, true);
+                    }
+                    
+                    Color label_color = sel ? TuiRendererLocal::TEXT_WHITE : TuiRendererLocal::TEXT_GRAY;
+                    renderer.draw_string(target_x + 1, 2 + row, label, label_color, true, row_bg, true);
+                    
+                    Color val_color = sel ? TuiRendererLocal::CYAN : TuiRendererLocal::TEXT_WHITE;
+                    if (pct >= 0.0) {
+                        int bar_w = 12;
+                        renderer.draw_bar(target_x + max_w - 24, 2 + row, bar_w, pct, TuiRendererLocal::TEAL, TuiRendererLocal::CYAN);
+                        renderer.draw_string(target_x + max_w - 10, 2 + row, val, val_color, true, row_bg, true);
+                    } else {
+                        renderer.draw_string(target_x + max_w - val.length() - 2, 2 + row, val, val_color, true, row_bg, true);
+                    }
                 };
-                auto rv = [&](int i, const char* l, const std::string& v) { pRow(i, l, v, tuiSel == i); };
-                rv(0,  "Mode",     std::to_string(int(tuiMode)) + " " + mn(tuiMode));
-                rv(1,  "Bars",     std::to_string(tuiState.numBars));
-                rv(2,  "Sens",     std::to_string(tuiState.sensitivity));
-                rv(3,  "Zoom",     std::to_string(tuiState.zoom));
-                rv(4,  "WZoom",    std::to_string(tuiState.waveZoom));
-                rv(5,  "WSpeed",   std::to_string(tuiState.waveSpeed));
-                rv(6,  "Bloom",    std::string(tag(tuiState.bloom)) + "  Int " + std::to_string(tuiState.bloomIntensity));
-                rv(7,  "AA",       std::string(tag(tuiState.antiAliasing)));
-                rv(8,  "Jump",     std::string(tag(tuiState.jumpColor)) + "  Sens " + std::to_string(tuiState.jumpSensitivity));
-                rv(9,  "JGrad",    std::string(tag(tuiState.jumpOnGradient)));
-                rv(10, "Diff",     std::string(tag(tuiState.diffColor)) + "  Sens " + std::to_string(tuiState.diffSensitivity));
-                rv(11, "B-AMU",    std::to_string(tuiState.limitMultiplier));
-                rv(12, "TrueXY",   xym(tuiState.trueXYMode));
-                rv(13, "Grad",     std::to_string(tuiState.gradientColorCount) + " " + cm(tuiState.colorMode));
-                rv(14, "AScope",   std::string(tag(tuiState.analogScope)));
-                rv(15, "Smooth",   std::string(tag(tuiState.lineSmooth)) + "  Sharp " + std::to_string(tuiState.lineSharpness));
-                int usedRows = 17;
-                // Bottom border
-                if (usedRows < th) {
-                    std::cout << "\033[1;36m\xe2\x95\x9a";
-                    for (int i = 0; i < std::min(tw - 2, tw - 2); ++i) std::cout << "\xe2\x95\x90";
-                    std::cout << "\xe2\x95\x9d\033[0m\n";
+
+                // Populate rows
+                // Left col parameters
+                draw_row(0, 0, 0, "Mode", std::to_string(static_cast<int>(tuiMode)) + " " + mn(tuiMode));
+                draw_row(1, 0, 1, "Bars", std::to_string(tuiState.numBars), (tuiState.numBars / 512.0) * 100.0);
+                draw_row(2, 0, 2, "Sensitivity", std::to_string((int)tuiState.sensitivity) + "." + std::to_string((int)(tuiState.sensitivity * 10) % 10), (tuiState.sensitivity / 10.0) * 100.0);
+                draw_row(3, 0, 3, "Zoom", std::to_string((int)tuiState.zoom) + "." + std::to_string((int)(tuiState.zoom * 10) % 10), (tuiState.zoom / 5.0) * 100.0);
+                draw_row(4, 0, 4, "Wave Zoom", std::to_string((int)tuiState.waveZoom) + "." + std::to_string((int)(tuiState.waveZoom * 10) % 10), (tuiState.waveZoom / 10.0) * 100.0);
+                draw_row(5, 0, 5, "Wave Speed", std::to_string((int)tuiState.waveSpeed) + "." + std::to_string((int)(tuiState.waveSpeed * 10) % 10), (tuiState.waveSpeed / 20.0) * 100.0);
+                draw_row(6, 0, 6, "TrueXY Mode", xym(tuiState.trueXYMode));
+                draw_row(7, 0, 7, "Analog Scope", tuiState.analogScope ? "ON" : "OFF");
+                draw_row(8, 0, 8, "Line Smooth", (tuiState.lineSmooth ? "ON" : "OFF") + (" (" + std::to_string((int)tuiState.lineSharpness) + "." + std::to_string((int)(tuiState.lineSharpness * 10) % 10) + ")"), (tuiState.lineSharpness / 5.0) * 100.0);
+
+                // Right col parameters
+                draw_row(9, 1, 0, "Bloom Effect", (tuiState.bloom ? "ON" : "OFF") + (" (" + std::to_string((int)tuiState.bloomIntensity) + "." + std::to_string((int)(tuiState.bloomIntensity * 10) % 10) + ")"), (tuiState.bloomIntensity / 2.5) * 100.0);
+                draw_row(10, 1, 1, "AA / Glow", (tuiState.antiAliasing ? "ON" : "OFF") + std::string(" / ") + (tuiState.glow ? "ON" : "OFF"));
+                draw_row(11, 1, 2, "Jump Color", (tuiState.jumpColor ? "ON" : "OFF") + (" (" + std::to_string((int)tuiState.jumpSensitivity) + "." + std::to_string((int)(tuiState.jumpSensitivity * 10) % 10) + ")"), (tuiState.jumpSensitivity / 5.0) * 100.0);
+                draw_row(12, 1, 3, "Jump Gradient", tuiState.jumpOnGradient ? "ON" : "OFF");
+                draw_row(13, 1, 4, "Diff Color", (tuiState.diffColor ? "ON" : "OFF") + (" (" + std::to_string((int)tuiState.diffSensitivity) + "." + std::to_string((int)(tuiState.diffSensitivity * 10) % 10) + ")"), (tuiState.diffSensitivity / 5.0) * 100.0);
+                draw_row(14, 1, 5, "B-AMU Limit", std::to_string((int)tuiState.limitMultiplier) + "." + std::to_string((int)(tuiState.limitMultiplier * 10) % 10), (tuiState.limitMultiplier / 10.0) * 100.0);
+                draw_row(15, 1, 6, "Color Gradient", std::to_string(tuiState.gradientColorCount) + " (" + cm(tuiState.colorMode) + ")", (tuiState.gradientColorCount / 64.0) * 100.0);
+
+                // Visualizer live animation preview
+                int preview_y = 12;
+                int preview_h = th - 16;
+                int preview_w = tw - 4;
+                if (preview_h > 2) {
+                    renderer.draw_box(1, preview_y, tw - 2, preview_h + 2, " LIVE VISUALIZATION PREVIEW ", TuiRendererLocal::BORDER, TuiRendererLocal::YELLOW);
+
+                    int px = 2;
+                    int py = preview_y + 1;
+                    int cx = px + preview_w / 2;
+                    int cy = py + preview_h / 2;
+                    double ts = now * tuiState.simSpeed;
+
+                    // Generate believable audio data: spectrum magnitudes + sample buffer
+                    std::vector<double> mags(preview_w, 0.0);
+                    double sample_buf[1024];
+                    for (int i = 0; i < preview_w; ++i) {
+                        double pct = (double)i / preview_w;
+                        // Low-end rumble
+                        double low = std::max(0.0, std::sin(pct * 3.0 + ts * 1.2)) * 0.6;
+                        // Mid peaks
+                        double mid = std::max(0.0, std::sin(pct * 8.0 - ts * 2.3)) * 0.4 * (0.6 + 0.4 * std::sin(ts * 0.7));
+                        // High shimmer
+                        double high = std::max(0.0, std::cos(pct * 18.0 + ts * 3.7)) * 0.2 * (0.5 + 0.5 * std::sin(ts * 1.3));
+                        // Noise
+                        double noise = ((double)(i * 12345 + 6789) / 2147483648.0) * 0.08;
+                        // Exponential falloff (real spectrum)
+                        double falloff = std::exp(-pct * 1.5);
+                        mags[i] = (low + mid + high + noise) * tuiState.sensitivity * falloff;
+                    }
+                    for (int i = 0; i < 1024 && i < preview_w * 4; ++i) {
+                        double t = (double)i / 256.0;
+                        sample_buf[i] = std::sin(t * 4.0 + ts * 6.0) * 0.3
+                                      + std::sin(t * 11.0 + ts * 4.0) * 0.2
+                                      + std::sin(t * 23.0 + ts * 7.3) * 0.1
+                                      + ((double)(i * 9876 + 1234) / 2147483648.0) * 0.05;
+                    }
+
+                    // λ for bar rendering (shared by bar modes)
+                    auto draw_bars = [&](bool dense, bool mirrored, int bars) {
+                        int bw = bars > 0 ? std::min(bars, preview_w) : preview_w;
+                        double step = (double)preview_w / bw;
+                        for (int b = 0; b < bw; ++b) {
+                            int col = (int)(b * step);
+                            int col_end = (int)((b + 1) * step);
+                            int mi = (int)((double)b / bw * preview_w);
+                            double h_val = mags[std::min(mi, preview_w - 1)] * preview_h;
+                            int bar_h = (int)std::clamp(h_val, 0.0, (double)preview_h);
+                            Color c = TuiRendererLocal::interpolate(TuiRendererLocal::GREEN, TuiRendererLocal::RED, (double)b / bw);
+                            for (int x = col; x < col_end && x < preview_w; ++x) {
+                                for (int r = 0; r < bar_h; ++r) {
+                                    renderer.draw_cell(px + x, py + preview_h - 1 - r, dense ? "█" : "▓", c);
+                                }
+                                if (mirrored) {
+                                    for (int r = 0; r < bar_h; ++r) {
+                                        renderer.draw_cell(px + x, py + r, dense ? "█" : "▓", c);
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    switch (tuiMode) {
+                        case VisMode::TrueXY: {
+                            double scale = std::min(preview_w, preview_h) * 0.4;
+                            double a = 3.0 + 0.5 * std::sin(ts * 0.3), b = 2.0;
+                            for (double t = 0; t < 6.28; t += 0.04) {
+                                double lx = std::sin(a * t + ts * 2.5) * scale;
+                                double ly = std::cos(b * t) * scale;
+                                int sx = cx + (int)lx, sy = cy + (int)ly;
+                                renderer.draw_cell(sx, sy, "█", TuiRendererLocal::CYAN);
+                            }
+                            break;
+                        }
+                        case VisMode::Oscilloscope:
+                        case VisMode::OscilloscopeLegacy: {
+                            int center_y = preview_h / 2;
+                            for (int col = 0; col < preview_w; ++col) {
+                                int si = col * 1024 / preview_w;
+                                double val = sample_buf[std::min(si, 1023)] * tuiState.zoom * (preview_h / 2 - 1);
+                                int sy = center_y + (int)val;
+                                Color c = TuiRendererLocal::interpolate(TuiRendererLocal::TEAL, TuiRendererLocal::MAGENTA, (double)col / preview_w);
+                                renderer.draw_cell(px + col, sy, "█", c);
+                            }
+                            break;
+                        }
+                        case VisMode::SpectrumBars:
+                            draw_bars(false, false, (int)tuiState.numBars);
+                            break;
+                        case VisMode::MirroredWaveform: {
+                            int center_y = preview_h / 2;
+                            for (int col = 0; col < preview_w; ++col) {
+                                int si = col * 1024 / preview_w;
+                                double val = sample_buf[std::min(si, 1023)] * tuiState.zoom * (preview_h / 2 - 1);
+                                int sy = center_y + (int)val;
+                                Color c = TuiRendererLocal::interpolate(TuiRendererLocal::TEAL, TuiRendererLocal::MAGENTA, (double)col / preview_w);
+                                renderer.draw_cell(px + col, sy, "█", c);
+                                renderer.draw_cell(px + col, center_y - (int)val, "█", c);
+                            }
+                            break;
+                        }
+                        case VisMode::CircularOscilloscope: {
+                            double radius = std::min(preview_w, preview_h) * 0.35;
+                            for (int i = 0; i < preview_w; ++i) {
+                                double angle = 6.28 * i / preview_w;
+                                int si = i * 1024 / preview_w;
+                                double mod = 1.0 + sample_buf[std::min(si, 1023)] * tuiState.zoom * 0.3;
+                                double r = radius * mod;
+                                int sx = cx + (int)(std::cos(angle) * r);
+                                int sy = cy + (int)(std::sin(angle) * r);
+                                renderer.draw_cell(sx, sy, "█", TuiRendererLocal::interpolate(TuiRendererLocal::TEAL, TuiRendererLocal::MAGENTA, (double)i / preview_w));
+                            }
+                            break;
+                        }
+                        case VisMode::CircularSpectrum: {
+                            double radius = std::min(preview_w, preview_h) * 0.3;
+                            int bands = std::min((int)tuiState.numBars, preview_w);
+                            for (int i = 0; i < bands; ++i) {
+                                double angle = 6.28 * i / bands;
+                                double mag = mags[i * preview_w / bands] * tuiState.sensitivity;
+                                double r = radius + mag * radius * 0.8;
+                                int sx = cx + (int)(std::cos(angle) * r);
+                                int sy = cy + (int)(std::sin(angle) * r);
+                                renderer.draw_cell(sx, sy, "█", TuiRendererLocal::interpolate(TuiRendererLocal::GREEN, TuiRendererLocal::RED, (double)i / bands));
+                            }
+                            break;
+                        }
+                        case VisMode::Lissajous: {
+                            double scale = std::min(preview_w, preview_h) * 0.4;
+                            double a = 3.0, b = 2.0, phase = ts * 2.0;
+                            for (double t = 0; t < 6.28; t += 0.03) {
+                                double lx = std::sin(a * t + phase) * scale;
+                                double ly = std::cos(b * t + std::sin(ts * 0.5) * 0.5) * scale;
+                                int sx = cx + (int)lx, sy = cy + (int)ly;
+                                renderer.draw_cell(sx, sy, "█", TuiRendererLocal::interpolate(TuiRendererLocal::MAGENTA, TuiRendererLocal::CYAN, (t / 6.28)));
+                            }
+                            break;
+                        }
+                        case VisMode::DenseSpectrum:
+                            draw_bars(true, false, preview_w);
+                            break;
+                        case VisMode::CircularMesh: {
+                            double radius = std::min(preview_w, preview_h) * 0.35;
+                            int segments = std::min((int)tuiState.numBars, preview_w);
+                            double pulse = 1.0 + 0.15 * std::sin(ts * 2.0);
+                            for (int i = 0; i < segments; ++i) {
+                                double angle1 = 6.28 * i / segments;
+                                double angle2 = 6.28 * (i + 1) / segments;
+                                double mag = mags[i * preview_w / segments] * 0.5;
+                                double r1 = radius * pulse + mag * radius;
+                                double r2 = radius * pulse * 0.6 + mag * radius;
+                                int x1 = cx + (int)(std::cos(angle1) * r1);
+                                int y1 = cy + (int)(std::sin(angle1) * r1);
+                                int x2 = cx + (int)(std::cos(angle2) * r1);
+                                int y2 = cy + (int)(std::sin(angle2) * r1);
+                                int x3 = cx + (int)(std::cos(angle1) * r2);
+                                int y3 = cy + (int)(std::sin(angle1) * r2);
+                                renderer.draw_cell(x1, y1, "█", TuiRendererLocal::CYAN);
+                                renderer.draw_cell(x2, y2, "█", TuiRendererLocal::CYAN);
+                                renderer.draw_cell(x3, y3, "█", TuiRendererLocal::TEAL);
+                            }
+                            break;
+                        }
+                        case VisMode::PulseRings: {
+                            double radius = std::min(preview_w, preview_h) * 0.3;
+                            for (int ring = 0; ring < 4; ++ring) {
+                                double r = radius * (0.4 + 0.2 * ring) + 3.0 * std::sin(ts * (1.0 + 0.3 * ring));
+                                Color c = TuiRendererLocal::interpolate(TuiRendererLocal::GREEN, TuiRendererLocal::CYAN, ring / 4.0);
+                                for (double a = 0; a < 6.28; a += 0.1) {
+                                    int sx = cx + (int)(std::cos(a + ts * 0.5 * ring) * r);
+                                    int sy = cy + (int)(std::sin(a + ts * 0.5 * ring) * r);
+                                    renderer.draw_cell(sx, sy, "█", c);
+                                }
+                            }
+                            break;
+                        }
+                        case VisMode::ParticleField: {
+                            for (int i = 0; i < 60; ++i) {
+                                double angle = (i * 1.618 + ts * 0.5);
+                                double dist = 0.2 + 0.8 * (0.5 + 0.5 * std::sin(i * 0.7 + ts * 1.3));
+                                double r = std::min(preview_w, preview_h) * 0.4 * dist;
+                                int sx = cx + (int)(std::cos(angle) * r);
+                                int sy = cy + (int)(std::sin(angle) * r);
+                                if (sx >= px && sx < px + preview_w && sy >= py && sy < py + preview_h) {
+                                    renderer.draw_cell(sx, sy, ".", TuiRendererLocal::interpolate(TuiRendererLocal::TEAL, TuiRendererLocal::YELLOW, dist));
+                                }
+                            }
+                            break;
+                        }
+                        case VisMode::LedBars: {
+                            int bw = std::min((int)tuiState.numBars, preview_w);
+                            double step = (double)preview_w / bw;
+                            for (int b = 0; b < bw; ++b) {
+                                int col = (int)(b * step);
+                                int mi = b * preview_w / bw;
+                                double h_val = mags[std::min(mi, preview_w - 1)] * preview_h;
+                                int bar_h = (int)std::clamp(h_val, 0.0, (double)preview_h);
+                                // Draw LED dots
+                                Color c = TuiRendererLocal::interpolate(TuiRendererLocal::GREEN, TuiRendererLocal::RED, (double)b / bw);
+                                for (int led = 0; led < bar_h; led += 2) {
+                                    renderer.draw_cell(px + col, py + preview_h - 1 - led, "●", c);
+                                }
+                            }
+                            break;
+                        }
+                        case VisMode::CircularSpectrumFilled: {
+                            double radius = std::min(preview_w, preview_h) * 0.3;
+                            int bands = std::min((int)tuiState.numBars, preview_w);
+                            for (int i = 0; i < bands; ++i) {
+                                double angle = 6.28 * i / bands;
+                                double mag = mags[i * preview_w / bands] * tuiState.sensitivity;
+                                double r_outer = radius + mag * radius * 0.8;
+                                double r_inner = radius * 0.3;
+                                Color c = TuiRendererLocal::interpolate(TuiRendererLocal::GREEN, TuiRendererLocal::RED, (double)i / bands);
+                                for (double r = r_inner; r < r_outer; r += 1.0) {
+                                    int sx = cx + (int)(std::cos(angle) * r);
+                                    int sy = cy + (int)(std::sin(angle) * r);
+                                    if (sx >= px && sx < px + preview_w && sy >= py && sy < py + preview_h) {
+                                        renderer.draw_cell(sx, sy, "█", c);
+                                    }
+                                }
+                            }
+                            // Center pulsing disc
+                            double disc_r = 1.0 + mags[0] * tuiState.centerSensitivity * 5.0;
+                            for (double a = 0; a < 6.28; a += 0.3) {
+                                int sx = cx + (int)(std::cos(a) * disc_r);
+                                int sy = cy + (int)(std::sin(a) * disc_r);
+                                renderer.draw_cell(sx, sy, "█", TuiRendererLocal::YELLOW);
+                            }
+                            break;
+                        }
+                        case VisMode::DenseSpectrumMirrored:
+                            draw_bars(true, true, preview_w);
+                            break;
+                        default: {
+                            double scale = std::min(preview_w, preview_h) * 0.35;
+                            for (double a = 0; a < 6.28; a += 0.06) {
+                                double mod = 1.0 + 0.3 * std::sin(a * 5.0 - ts * 3.0) * (0.5 + 0.5 * std::cos(ts * 2.0));
+                                int sx = cx + (int)(std::cos(a + ts) * scale * mod);
+                                int sy = cy + (int)(std::sin(a + ts) * scale * mod);
+                                renderer.draw_cell(sx, sy, "█", TuiRendererLocal::interpolate(TuiRendererLocal::CYAN, TuiRendererLocal::MAGENTA, std::sin(a) * 0.5 + 0.5));
+                            }
+                            break;
+                        }
+                    }
                 }
-                // Keybinds hint
-                if (usedRows + 2 < th) {
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m \033[90m\xe2\x86\x91\xe2\x86\x93\xe2\x86\x90\xe2\x86\x92/Enter Nav"
-                        "  Esc/T/Quit  Scroll Adj\033[0m";
-                    int klen = 56;
-                    for (int i = klen; i < tw - 3; ++i) std::cout << " ";
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
-                }
-                if (usedRows + 3 < th) {
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m \033[90mConfig: " << cfgPath << "\033[0m";
-                    int klen = 10 + static_cast<int>(cfgPath.size());
-                    for (int i = klen; i < tw - 3; ++i) std::cout << " ";
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
-                }
-                std::cout << "\033[J";
-                std::cout.flush();
+
+                // Help footer box
+                int info_y = th - 3;
+                renderer.draw_box(0, info_y, tw, 3, "", TuiRendererLocal::BORDER, TuiRendererLocal::TEXT_WHITE);
+                renderer.draw_string(2, info_y + 1, " Nav: [↑][↓] Navigate | [←][→] Adjust value | [Enter] Toggle | [Esc/q] Quit ", TuiRendererLocal::TEXT_WHITE);
+                
+                std::string path_lbl = " Config: " + cfgPath + " ";
+                renderer.draw_string(tw - path_lbl.length() - 2, info_y + 1, path_lbl, TuiRendererLocal::TEXT_GRAY);
+
+                renderer.render();
             }
+
             // ~60 Hz sleep
             struct timespec sleep_ts = { 0, 16000000 };
             nanosleep(&sleep_ts, nullptr);
@@ -3087,6 +3977,8 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    if (flagSetTransparentFb && startTransparentFb)
+        glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, GLFW_TRUE);
 
     GLFWwindow* window = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT,
                                            "Audio Visualizer", nullptr, nullptr);
@@ -3098,7 +3990,11 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
 
     glfwMakeContextCurrent(window);
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
-    glfwSwapInterval(1);
+    glfwSwapInterval(0);
+
+    // Apply window opacity from config/startup
+    if (startWindowOpacity > 0.0f)
+        glfwSetWindowOpacity(window, startWindowOpacity);
 
     if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
         std::cerr << "Failed to initialize GLAD\n";
@@ -3114,6 +4010,14 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     glViewport(0, 0, fbWidth, fbHeight);
     glEnable(GL_BLEND);
     glEnable(GL_PROGRAM_POINT_SIZE);
+
+    // ── ImGui init (always, control window optional) ──
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 460");
 
     AudioCapture audio(RING_BUFFER_SIZE);
     if (!audio.start()) {
@@ -3145,12 +4049,14 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     GLuint lineVAO = 0, lineVBO = 0;
     GLuint fillVAO = 0, fillVBO = 0;
     GLuint glowVAO = 0, glowVBO = 0;
+    GLuint tipVAO = 0, tipVBO = 0;
+    GLuint shadowVAO = 0, shadowVBO = 0;
     setupVAO(lineVAO, lineVBO, MAX_LINE_VERTICES);
     setupVAO(fillVAO, fillVBO, MAX_FILL_VERTICES);
     setupVAO(glowVAO, glowVBO, MAX_GLOW_VERTICES);
+    setupVAO(tipVAO, tipVBO, MAX_TIP_VERTICES);
+    setupVAO(shadowVAO, shadowVBO, MAX_FILL_VERTICES);
 
-
-    glfwSwapInterval(0);
 
     GLuint msaaFBO = 0, msaaColorRBO = 0;
     bool msaaReady = createMsaaFramebuffer(fbWidth, fbHeight, msaaFBO, msaaColorRBO);
@@ -3168,6 +4074,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     VisMode mode = VisMode::Oscilloscope;
 
     if (startMode >= 0)           mode = static_cast<VisMode>(startMode);
+    state.controlWindow = controlWindow;
     if (startBars > 0)            state.numBars = std::min(startBars, state.maxBarsLimit);
     if (startSensitivity > 0.0f)  state.sensitivity = startSensitivity;
     if (startZoom > 0.0f)         state.zoom = startZoom;
@@ -3176,6 +4083,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     if (flagSetBloom)             state.bloom = startBloom;
     if (startBloomIntensity > 0.0f) state.bloomIntensity = startBloomIntensity;
     if (flagSetAA)                state.antiAliasing = startAntiAlias;
+    if (flagSetGlow)              state.glow = startGlow;
     if (flagSetJump)              state.jumpColor = startJumpColor;
     if (startJumpSens > 0.0f)     state.jumpSensitivity = startJumpSens;
     if (flagSetDiff)              state.diffColor = startDiffColor;
@@ -3192,6 +4100,33 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     if (startAnalogLines > 0)     state.analogLineCount = startAnalogLines;
     if (startParticles > 0)       state.particleCount = startParticles;
     if (startBAmu > 0.0f)         state.limitMultiplier = startBAmu;
+    if (startBloomSteps > 0)      state.bloomSteps = startBloomSteps;
+    if (startBloomRings >= 0)     state.bloomRings = startBloomRings;
+    if (startBloomBallIntensity > 0.0f) state.bloomBallIntensity = startBloomBallIntensity;
+    if (startBloomBallAmount > 0.0f) state.bloomBallAmount = startBloomBallAmount;
+    if (startWindowOpacity > 0.0f) state.windowOpacity = startWindowOpacity;
+    if (startParticleSize > 0.0f) state.particleSize = startParticleSize;
+    if (flagSetBarsOnly)          state.barsOnly = startBarsOnly;
+    if (flagSetLinesOnly)         state.linesOnly = startLinesOnly;
+    if (flagSetParticlesOnly)         state.particlesOnly = startParticlesOnly;
+    if (startSimSpeed > 0.0f)         state.simSpeed = startSimSpeed;
+    if (startBloomShape >= 0)         state.bloomShape = startBloomShape;
+    if (startCenterSensitivity > 0.0f) state.centerSensitivity = startCenterSensitivity;
+    if (flagSetTransparentFb)         state.transparentFb = startTransparentFb;
+    if (flagSetLineSmooth)            state.lineSmooth = startLineSmooth;
+    if (startLineSharpness > 0.0f)    state.lineSharpness = startLineSharpness;
+    if (startColorMode >= 0)          state.colorMode = static_cast<ColorMode>(startColorMode);
+    if (startMinBars > 0)             state.minBars = startMinBars;
+    if (startMaxBars > 0)             state.maxBars = startMaxBars;
+    if (startDenseBarCap > 0)         state.denseBarCap = startDenseBarCap;
+    if (startMSAASamples > 0)         state.msaaSamples = startMSAASamples;
+    if (flagSetControlWindow)         state.controlWindow = startControlWindow;
+    if (flagSetColor)                 state.randomSolid = {startColor_r, startColor_g, startColor_b};
+    if (startGradientCount > 0) {
+        state.gradientColors.resize(startGradientCount);
+        for (size_t ci = 0; ci < startGradientCount; ++ci) state.gradientColors[ci] = startGradientColors[ci];
+    }
+    if (startCaptureMode >= 0)        state.inputMode = static_cast<InputMode>(startCaptureMode);
 
     auto saveConfigFile = [&](const std::string& path) {
         std::ofstream out(path);
@@ -3217,12 +4152,29 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         out << "--truexy-mode " << static_cast<int>(state.trueXYMode) << "\n";
         out << "--analog-scope " << b(state.analogScope) << "\n";
         out << "--particles " << state.particleCount << "\n";
+        out << "--particle-size " << state.particleSize << "\n";
+        out << "--bars-only " << b(state.barsOnly) << "\n";
+        out << "--lines-only " << b(state.linesOnly) << "\n";
+        out << "--particles-only " << b(state.particlesOnly) << "\n";
+        out << "--color " << state.randomSolid.r << " " << state.randomSolid.g << " " << state.randomSolid.b << "\n";
+        for (size_t ci = 0; ci < state.gradientColors.size(); ++ci)
+            out << "--gradient-color-" << (ci + 1) << " " << state.gradientColors[ci].r << " " << state.gradientColors[ci].g << " " << state.gradientColors[ci].b << "\n";
+        out << "--sim-speed " << state.simSpeed << "\n";
+        { const char* shapes[] = {"ball","square","triangle"}; out << "--bloom-shape " << shapes[state.bloomShape] << "\n"; }
+        out << "--spiral-galaxy-distance " << state.spiralGalaxyDistance << "\n";
+        out << "--center-sensitivity " << state.centerSensitivity << "\n";
+        out << "--control-window " << (state.controlWindow ? "on" : "off") << "\n";
+        auto capLabel = [](InputMode m) -> const char* {
+            switch (m) { case InputMode::Microphone: return "mic"; case InputMode::SystemAudio: return "system"; case InputMode::Both: return "both"; case InputMode::Reduction: return "reduction"; } return "mic";
+        };
+        out << "--capture " << capLabel(state.inputMode) << "\n";
+        out << "--glow " << b(state.glow) << "\n";
         out << std::flush;
     };
-    if (startSystem && audio.currentSource() != CaptureSource::SystemAudio)
-        audio.switchSource(CaptureSource::SystemAudio);
-    if (startMic && audio.currentSource() != CaptureSource::Microphone)
-        audio.switchSource(CaptureSource::Microphone);
+    if (startCaptureMode >= 0) {
+        CaptureMode cm = static_cast<CaptureMode>(startCaptureMode);
+        if (audio.currentMode() != cm) audio.switchMode(cm);
+    }
 
     std::cout << "Mode: " << modeName(mode) << "\n";
 
@@ -3257,6 +4209,8 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     std::vector<float> circularSpectrumHeights;
     std::vector<float> denseHeights;
     std::vector<float> circularFilledHeights;
+    std::vector<float> smoothedColumns;
+    std::vector<float> smoothedHeights;
     std::vector<float> pulseBands(3, 0.0f);
     float jumpBg = 0.0f;
     float jumpCooldown = 0.0f;
@@ -3266,13 +4220,52 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     float diffBg = 0.0f;
     float diffCooldown = 0.0f;
     float diffLastPeak = 0.0f;
-    resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights);
+    resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights, smoothedColumns, smoothedHeights);
 
     constexpr float kBloomIntensityLevels[] = {0.5f, 1.0f, 1.5f, 2.0f, 2.5f};
     size_t bloomIntensityIndex = 1;
     state.bloomIntensity = kBloomIntensityLevels[bloomIntensityIndex];
 
+    bool configNeedsSave = false;
+    double lastConfigModTime = 0.0;
+    time_t lastMtime = 0;
+    if (!configSavePath.empty()) {
+        struct stat result;
+        if (stat(configSavePath.c_str(), &result) == 0) {
+            lastMtime = result.st_mtime;
+        }
+    }
+
     while (!glfwWindowShouldClose(window)) {
+        // --- Reload config from disk if changed by another process (e.g. TUI editor) ---
+        static double lastConfigCheck = 0.0;
+        double currentCheckTime = glfwGetTime();
+        if (!configSavePath.empty() && currentCheckTime - lastConfigCheck >= 2.0) {
+            lastConfigCheck = currentCheckTime;
+            struct stat result;
+            if (stat(configSavePath.c_str(), &result) == 0) {
+                time_t mtime = result.st_mtime;
+                if (mtime != lastMtime) {
+                    lastMtime = mtime;
+                    std::cout << "Config changed on disk. Reloading...\n";
+                    loadLiveConfigFile(configSavePath, state, mode);
+                      { CaptureMode acm;
+                        switch (state.inputMode) {
+                            case InputMode::Microphone:  acm = CaptureMode::Microphone; break;
+                            case InputMode::SystemAudio: acm = CaptureMode::SystemAudio; break;
+                            case InputMode::Reduction:   acm = CaptureMode::Reduction; break;
+                            default:                     acm = CaptureMode::Both; break;
+                      }
+                      if (audio.currentMode() != acm) audio.switchMode(acm);
+                    }
+                    resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights, smoothedColumns, smoothedHeights);
+                }
+            }
+        }
+
+        VisState previous_loop_state = state;
+        VisMode previous_loop_mode = mode;
+
         // --- Resize handling ---
         int currentFbWidth, currentFbHeight;
         glfwGetFramebufferSize(window, &currentFbWidth, &currentFbHeight);
@@ -3289,9 +4282,17 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         }
 
         // --- Mode switching ---
+        const bool shiftHeld = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                                glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+        const bool ctrlHeld  = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                                glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
         for (int k = 0; k <= 9; ++k) {
             int key = (k == 0) ? GLFW_KEY_0 : (GLFW_KEY_1 + k - 1);
             if (glfwGetKey(window, key) == GLFW_PRESS) {
+                // SHIFT+0/1/2/7/8 mapped to modes 15/12/13/10/11 below
+                if ((k == 0 || k == 1 || k == 2 || k == 7 || k == 8) && shiftHeld) continue;
+                // CTRL+1 handled separately for legacy oscilloscope
+                if (k == 1 && ctrlHeld) continue;
                 const VisMode requested = static_cast<VisMode>(k);
                 if (requested != mode) {
                     mode = requested;
@@ -3300,8 +4301,59 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
                         std::cout << "Analog Scope: off\n";
                     }
                     std::cout << "Mode: " << modeName(mode) << "\n";
+                    if (mode == VisMode::ParticleField) {
+                        state.bloomSteps = 12; state.bloomRings = 0; state.bloom = true;
+                        state.bloomShape = 0; state.bloomBallIntensity = 40.0f;
+std::cout << "Bloom: steps=12 (SpiralGalaxy)\n";
+                    }
                 }
             }
+        }
+        // SHIFT+7/8 for modes 10/11
+        if (shiftHeld && glfwGetKey(window, GLFW_KEY_7) == GLFW_PRESS && mode != VisMode::ParticleField) {
+            mode = VisMode::ParticleField;
+            if (state.analogScope) { state.analogScope = false; std::cout << "Analog Scope: off\n"; }
+            std::cout << "Mode: " << modeName(mode) << "\n";
+            if (mode == VisMode::ParticleField) {
+                state.bloomSteps = 12; state.bloomRings = 0; state.bloom = true;
+                state.bloomShape = 0; state.bloomBallIntensity = 40.0f;
+                std::cout << "Bloom: steps=12 (SpiralGalaxy)\n";
+            }
+        }
+        if (shiftHeld && glfwGetKey(window, GLFW_KEY_8) == GLFW_PRESS && mode != VisMode::LedBars) {
+            mode = VisMode::LedBars;
+            if (state.analogScope) { state.analogScope = false; std::cout << "Analog Scope: off\n"; }
+            std::cout << "Mode: " << modeName(mode) << "\n";
+        }
+        // SHIFT+1 for mode 12
+        if (shiftHeld && glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS && mode != VisMode::CircularSpectrumFilled) {
+            mode = VisMode::CircularSpectrumFilled;
+            if (state.analogScope) { state.analogScope = false; std::cout << "Analog Scope: off\n"; }
+            std::cout << "Mode: " << modeName(mode) << "\n";
+        }
+        // SHIFT+2 for mode 13
+        if (shiftHeld && glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS && mode != VisMode::DenseSpectrumMirrored) {
+            mode = VisMode::DenseSpectrumMirrored;
+            if (state.analogScope) { state.analogScope = false; std::cout << "Analog Scope: off\n"; }
+            std::cout << "Mode: " << modeName(mode) << "\n";
+        }
+        // SHIFT+0 for mode 15 (Particle Grid)
+        if (shiftHeld && glfwGetKey(window, GLFW_KEY_0) == GLFW_PRESS && mode != VisMode::ParticleGrid) {
+            mode = VisMode::ParticleGrid;
+            if (state.analogScope) { state.analogScope = false; std::cout << "Analog Scope: off\n"; }
+            std::cout << "Mode: " << modeName(mode) << "\n";
+            if (mode == VisMode::ParticleGrid) {
+                state.bloomSteps = 12; state.bloomRings = 0; state.bloom = true;
+                state.bloomShape = 0; state.bloomBallIntensity = 40.0f;
+                std::cout << "Bloom: steps=12 (ParticleGrid)\n";
+            }
+        }
+        // CTRL+1 for legacy oscilloscope (mode 14)
+        if ((glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS) &&
+            glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS && mode != VisMode::OscilloscopeLegacy) {
+            mode = VisMode::OscilloscopeLegacy;
+            if (state.analogScope) { state.analogScope = false; std::cout << "Analog Scope: off\n"; }
+            std::cout << "Mode: " << modeName(mode) << "\n";
         }
 
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
@@ -3309,8 +4361,13 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         }
 
         // --- Bar count or Wave Zoom (Left / Right) ---
+        auto oscilloscopeWaveMode = [&]() {
+            return mode == VisMode::Oscilloscope || mode == VisMode::MirroredWaveform ||
+                   mode == VisMode::TrueXY || mode == VisMode::OscilloscopeLegacy ||
+                   mode == VisMode::CircularOscilloscope || mode == VisMode::Lissajous;
+        };
         if (keyEdge(window, GLFW_KEY_LEFT, prevKeys)) {
-            if (mode == VisMode::Oscilloscope || mode == VisMode::MirroredWaveform || mode == VisMode::TrueXY) {
+            if (oscilloscopeWaveMode()) {
                 if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
                     state.waveSpeed -= 0.1f;
                     std::cout << "Wave Speed: " << state.waveSpeed << "\n";
@@ -3321,13 +4378,13 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             } else {
                 if (state.numBars > MIN_BARS) {
                     state.numBars = (state.numBars - MIN_BARS >= 4) ? state.numBars - 4 : MIN_BARS;
-                    resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights);
+                    resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights, smoothedColumns, smoothedHeights);
                     std::cout << "Bars: " << state.numBars << "\n";
                 }
             }
         }
         if (keyEdge(window, GLFW_KEY_RIGHT, prevKeys)) {
-            if (mode == VisMode::Oscilloscope || mode == VisMode::MirroredWaveform || mode == VisMode::TrueXY) {
+            if (oscilloscopeWaveMode()) {
                 if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
                     state.waveSpeed += 0.1f;
                     std::cout << "Wave Speed: " << state.waveSpeed << "\n";
@@ -3338,7 +4395,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             } else {
                 if (state.numBars < state.maxBarsLimit) {
                     state.numBars = std::min<size_t>(state.maxBarsLimit, state.numBars + 4);
-                    resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights);
+                    resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights, smoothedColumns, smoothedHeights);
                     std::cout << "Bars: " << state.numBars << "\n";
                 }
             }
@@ -3364,10 +4421,10 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
 
         // --- Zoom (- and =) ---
         if (glfwGetKey(window, GLFW_KEY_MINUS) == GLFW_PRESS) {
-            state.zoom = std::max(0.3f, state.zoom - 0.01f);
+            state.zoom = std::max(0.01f, state.zoom - 0.01f);
         }
         if (glfwGetKey(window, GLFW_KEY_EQUAL) == GLFW_PRESS) {
-            state.zoom = std::min(3.0f, state.zoom + 0.01f);
+            state.zoom = std::min(100000.0f, state.zoom + 0.01f);
         }
 
         // --- Color modes ---
@@ -3410,27 +4467,41 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
         }
 
         // --- Audio input source ---
-        if (keyEdge(window, GLFW_KEY_M, prevKeys)) {
-            if (audio.switchSource(CaptureSource::Microphone)) {
-                state.inputMode = InputMode::Microphone;
-                std::cout << "Input: Microphone\n";
-            } else {
-                std::cerr << "Failed to switch to microphone input\n";
+        auto setInputMode = [&](InputMode im) {
+            CaptureMode cm;
+            switch (im) {
+                case InputMode::Microphone:  cm = CaptureMode::Microphone; break;
+                case InputMode::SystemAudio: cm = CaptureMode::SystemAudio; break;
+                case InputMode::Both:        cm = CaptureMode::Both; break;
+                case InputMode::Reduction:   cm = CaptureMode::Reduction; break;
+                default: return;
             }
-        }
-        if (keyEdge(window, GLFW_KEY_S, prevKeys)) {
-            if (audio.switchSource(CaptureSource::SystemAudio)) {
-                state.inputMode = InputMode::SystemAudio;
-                std::cout << "Input: System audio\n";
+            if (audio.switchMode(cm)) {
+                state.inputMode = im;
+                switch (im) {
+                    case InputMode::Microphone:  std::cout << "Input: Microphone\n"; break;
+                    case InputMode::SystemAudio: std::cout << "Input: System audio\n"; break;
+                    case InputMode::Both:        std::cout << "Input: Both\n"; break;
+                    case InputMode::Reduction:   std::cout << "Input: Reduction\n"; break;
+                    default: break;
+                }
             } else {
-                std::cerr << "Failed to switch to system audio input\n";
+                std::cerr << "Failed to switch input source\n";
             }
-        }
+        };
+        if (keyEdge(window, GLFW_KEY_M, prevKeys)) setInputMode(InputMode::Microphone);
+        if (keyEdge(window, GLFW_KEY_S, prevKeys)) setInputMode(InputMode::SystemAudio);
+        if (keyEdge(window, GLFW_KEY_B, prevKeys)) setInputMode(InputMode::Both);
 
         // --- Anti-aliasing ---
         if (keyEdge(window, GLFW_KEY_A, prevKeys)) {
             state.antiAliasing = !state.antiAliasing;
             std::cout << "Anti-aliasing: " << (state.antiAliasing ? "on" : "off") << "\n";
+        }
+        // --- Glow ---
+        if (keyEdge(window, GLFW_KEY_F, prevKeys)) {
+            state.glow = !state.glow;
+            std::cout << "Glow: " << (state.glow ? "on" : "off") << "\n";
         }
 
         // --- Bloom ---
@@ -3568,245 +4639,114 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             std::cout << "LineSharpness: " << state.lineSharpness << "\n";
         }
 
-        // --- TUI toggle & interactivity ---
+        // --- Bars-only toggle ` ---
+        if (keyEdge(window, GLFW_KEY_GRAVE_ACCENT, prevKeys)) {
+            state.barsOnly = !state.barsOnly;
+            std::cout << "Bars-only: " << (state.barsOnly ? "ON (lines hidden)" : "OFF") << "\n";
+        }
+        // --- Lines-only toggle L ---
+        if (keyEdge(window, GLFW_KEY_L, prevKeys)) {
+            state.linesOnly = !state.linesOnly;
+            std::cout << "Lines-only: " << (state.linesOnly ? "ON (fill hidden)" : "OFF") << "\n";
+        }
+        // --- Particles-only toggle P ---
+        if (keyEdge(window, GLFW_KEY_P, prevKeys)) {
+            state.particlesOnly = !state.particlesOnly;
+            std::cout << "Particles-only: " << (state.particlesOnly ? "ON (oscilloscope modes exempt)" : "OFF") << "\n";
+        }
+
+        // --- TUI toggle (simple read-only overlay) ---
         if (keyEdge(window, GLFW_KEY_T, prevKeys)) {
             tuiEnabled = !tuiEnabled;
-            tuiSelection = -1;
-            if (tuiEnabled) {
-#ifndef _WIN32
-                struct winsize ws;
-                if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
-                    termWidth = ws.ws_col;
-                    termHeight = ws.ws_row;
-                }
-#endif
-                if (termWidth < 60 || termHeight < 12) {
-                    std::cout << "\033[?1047h\033[2J\033[H"
-                        "\033[1;31mTUI needs 60x12 terminal (have " << termWidth
-                        << "x" << termHeight << ")\033[0m\n"
-                        "\033[?1047l";
-                    tuiEnabled = false;
-                    continue;
-                }
-                std::cout << "\033[?1047h\033[2J\033[H";
-                std::cout << "\033[?25l";
-                std::cout << "\033[?1000h\033[?1006h"; // enable mouse + SGR
-                std::cout << "\033[0m";
-            } else {
-                std::cout << "\033[?25h";
-                std::cout << "\033[?1006l\033[?1000l"; // disable mouse + SGR
-                std::cout << "\033[?1047l";
-#ifndef _WIN32
-                tcflush(STDIN_FILENO, TCIFLUSH);
-#endif
-            }
         }
-        if (tuiEnabled) {
-#ifndef _WIN32
-            struct winsize ws;
-            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
-                termWidth = ws.ws_col;
-                termHeight = ws.ws_row;
-            }
-#endif
-            // Poll stdin for mouse events (SGR encoding) — Linux only
-#ifndef _WIN32
-            {
-                struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
-                while (poll(&pfd, 1, 0) > 0) {
-                    char buf[32];
-                    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf) - 1);
-                    if (n <= 0) break;
-                    buf[n] = 0;
-                    // SGR: ESC [ <btn> ; <cx> ; <cy> M  (press) or m (release)
-                    char* p = buf;
-                    while (p && *p) {
-                        if (p[0] == '\033' && p[1] == '[') {
-                            int btn = 0, cx = 0, cy = 0;
-                            char endc = 0;
-                            if (sscanf(p + 2, "%d;%d;%d%c", &btn, &cx, &cy, &endc) >= 3) {
-                                if (btn == 0 && (endc == 'M' || endc == 'm')) {
-                                    // Row 1 = title, rows 2..17 = params 0..15
-                                    int paramIdx = cy - 2;
-                                    if (paramIdx >= 0 && paramIdx <= 15 && endc == 'M') {
-                                        tuiSelection = (tuiSelection == paramIdx) ? -1 : paramIdx;
-                                    }
-                                } else if (btn == 64 || btn == 65) {
-                                    // Scroll wheel: btn=64 ↑, btn=65 ↓
-                                    int delta = (btn == 64) ? 1 : -1;
-                                    if (tuiSelection >= 0) {
-                                        auto adj = [&](float& v, float step, float mn, float mx) {
-                                            v = std::clamp(v + static_cast<float>(delta) * step, mn, mx);
-                                        };
-                                        switch (tuiSelection) {
-                                            case 1: state.numBars = static_cast<size_t>(std::clamp(static_cast<int>(state.numBars) + delta * 4, static_cast<int>(MIN_BARS), static_cast<int>(state.maxBarsLimit))); break;
-                                            case 2: adj(state.sensitivity, 0.1f, 0.1f, state.maxSensitivityLimit); break;
-                                            case 3: adj(state.zoom, 0.1f, 0.3f, 5.0f); break;
-                                            case 4: adj(state.waveZoom, 0.1f, 0.1f, 10.0f); break;
-                                            case 5: adj(state.waveSpeed, 0.1f, 0.0f, 20.0f); break;
-                                            case 6: adj(state.bloomIntensity, 0.5f, 0.5f, 2.5f); break;
-                                            case 8: adj(state.jumpSensitivity, 0.25f, 0.25f, 5.0f); break;
-                                            case 10: adj(state.diffSensitivity, 0.25f, 0.25f, 5.0f); break;
-                                            case 11: adj(state.limitMultiplier, 0.5f, 0.5f, 10.0f); break;
-                                            case 13: state.gradientColorCount = static_cast<size_t>(std::clamp(static_cast<int>(state.gradientColorCount) + delta, 1, 64)); break;
-                                            case 15: adj(state.lineSharpness, 0.25f, 0.25f, 5.0f); break;
-                                            default: break;
-                                        }
-                                        if (!configSavePath.empty()) saveConfigFile(configSavePath);
-                                    }
-                                }
-                            }
-                            p = strchr(p + 2, '\033');
-                        } else {
-                            p++;
-                        }
-                    }
-                }
-            }
-#endif
-
-            // Arrow keys navigate, Enter/Left/Right adjust
-            auto selPrev = [&]() { tuiSelection = std::max(-1, tuiSelection - 1); };
-            auto selNext = [&]() { tuiSelection = std::min(15, tuiSelection + 1); };
-            auto selVal  = [&](int s) { tuiSelection = (tuiSelection == s) ? -1 : s; };
-            if (keyEdge(window, GLFW_KEY_UP, prevKeys)) selPrev();
-            if (keyEdge(window, GLFW_KEY_DOWN, prevKeys)) selNext();
-            if (keyEdge(window, GLFW_KEY_ENTER, prevKeys) && tuiSelection >= 0) {
-                switch (tuiSelection) {
-                    case 0: mode = static_cast<VisMode>((static_cast<int>(mode) + 1) % 10); break;
-                    case 1: state.numBars = std::min(state.maxBarsLimit, state.numBars + 4); break;
-                    case 2: state.sensitivity = std::min(state.maxSensitivityLimit, state.sensitivity + 0.1f); break;
-                    case 3: state.zoom = std::min(5.0f, state.zoom + 0.1f); break;
-                    case 4: state.waveZoom = std::min(10.0f, state.waveZoom + 0.1f); break;
-                    case 5: state.waveSpeed = std::min(20.0f, state.waveSpeed + 0.1f); break;
-                    case 6: state.bloom = !state.bloom; break;
-                    case 7: state.antiAliasing = !state.antiAliasing; break;
-                    case 8: state.jumpColor = !state.jumpColor; break;
-                    case 9: state.jumpOnGradient = !state.jumpOnGradient; break;
-                    case 10: state.diffColor = !state.diffColor; break;
-                    case 11: state.limitMultiplier = std::min(10.0f, state.limitMultiplier + 0.5f); break;
-                    case 12: state.trueXYMode = static_cast<TrueXYMode>((static_cast<int>(state.trueXYMode) + 1) % 6); break;
-                    case 13: state.gradientColorCount = std::min(size_t(64), state.gradientColorCount + 1); break;
-                    case 14: state.analogScope = !state.analogScope; break;
-                    case 15: state.lineSmooth = !state.lineSmooth; break;
-                }
-                if (!configSavePath.empty()) saveConfigFile(configSavePath);
-            }
-            if (tuiSelection >= 0) {
-                if (keyEdge(window, GLFW_KEY_RIGHT, prevKeys)) {
-                    switch (tuiSelection) {
-                        case 1: state.numBars = std::min(state.maxBarsLimit, state.numBars + 4); break;
-                        case 2: state.sensitivity = std::min(state.maxSensitivityLimit, state.sensitivity + 0.1f); break;
-                        case 3: state.zoom = std::min(5.0f, state.zoom + 0.1f); break;
-                        case 4: state.waveZoom = std::min(10.0f, state.waveZoom + 0.1f); break;
-                        case 5: state.waveSpeed = std::min(20.0f, state.waveSpeed + 0.1f); break;
-                        case 6: state.bloomIntensity = std::min(2.5f, state.bloomIntensity + 0.5f); break;
-                        case 8: state.jumpSensitivity = std::min(5.0f, state.jumpSensitivity + 0.25f); break;
-                        case 10: state.diffSensitivity = std::min(5.0f, state.diffSensitivity + 0.25f); break;
-                        case 11: state.limitMultiplier = std::min(10.0f, state.limitMultiplier + 0.5f); break;
-                        case 13: state.gradientColorCount = std::min(size_t(64), state.gradientColorCount + 1); break;
-                        case 15: state.lineSharpness = std::min(5.0f, state.lineSharpness + 0.25f); break;
-                    }
-                    if (!configSavePath.empty()) saveConfigFile(configSavePath);
-                }
-                if (keyEdge(window, GLFW_KEY_LEFT, prevKeys)) {
-                    switch (tuiSelection) {
-                        case 1: state.numBars = std::max(MIN_BARS, state.numBars - 4); break;
-                        case 2: state.sensitivity = std::max(0.1f, state.sensitivity - 0.1f); break;
-                        case 3: state.zoom = std::max(0.3f, state.zoom - 0.1f); break;
-                        case 4: state.waveZoom = std::max(0.1f, state.waveZoom - 0.1f); break;
-                        case 5: state.waveSpeed = std::max(0.0f, state.waveSpeed - 0.1f); break;
-                        case 6: state.bloomIntensity = std::min(2.5f, std::max(0.5f, state.bloomIntensity - 0.5f)); break;
-                        case 8: state.jumpSensitivity = std::max(0.25f, state.jumpSensitivity - 0.25f); break;
-                        case 10: state.diffSensitivity = std::max(0.25f, state.diffSensitivity - 0.25f); break;
-                        case 11: state.limitMultiplier = std::max(0.5f, state.limitMultiplier - 0.5f); break;
-                        case 13: state.gradientColorCount = std::max(size_t(1), state.gradientColorCount - 1); break;
-                        case 15: state.lineSharpness = std::max(0.25f, state.lineSharpness - 0.25f); break;
-                    }
-                    if (!configSavePath.empty()) saveConfigFile(configSavePath);
-                }
-            }
-            // Escape exits TUI
-            if (keyEdge(window, GLFW_KEY_ESCAPE, prevKeys)) {
-                tuiEnabled = false;
-                std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l";
-#ifndef _WIN32
-                tcflush(STDIN_FILENO, TCIFLUSH);
-#endif
-            }
+        // --- Control window toggle 'C' or RAlt ---
+        if (keyEdge(window, GLFW_KEY_C, prevKeys) ||
+            keyEdge(window, GLFW_KEY_RIGHT_ALT, prevKeys)) {
+            controlWindow = !controlWindow;
+        }
+        // --- Pause toggle Space ---
+        if (keyEdge(window, GLFW_KEY_SPACE, prevKeys)) {
+            state.paused = !state.paused;
+            std::cout << (state.paused ? "Paused\n" : "Resumed\n");
         }
 
         // --- Audio + FFT ---
-        audio.readLatestStereo(leftBuffer.data(), rightBuffer.data(), FFT_SIZE);
-        for (size_t i = 0; i < FFT_SIZE; ++i) {
-            sampleBuffer[i] = (leftBuffer[i] + rightBuffer[i]) * 0.5f;
-        }
-        fft::computeMagnitudeSpectrum(sampleBuffer.data(), FFT_SIZE, magnitudes);
-
-        if (state.jumpColor) {
-            float peak = 0.0f;
+        static modes::ModeOutput lastOutput;
+        if (!state.paused) {
+            audio.readLatestStereo(leftBuffer.data(), rightBuffer.data(), FFT_SIZE);
             for (size_t i = 0; i < FFT_SIZE; ++i) {
-                float absVal = fabsf(sampleBuffer[i]);
-                if (absVal > peak) peak = absVal;
+                sampleBuffer[i] = (leftBuffer[i] + rightBuffer[i]) * 0.5f;
             }
-            jumpBg += 0.02f * (peak - jumpBg);
-            float bg = fmaxf(jumpBg, 0.0001f);
-            float delta = peak - jumpLastPeak;
-            jumpLastPeak = jumpLastPeak * 0.5f + peak * 0.5f;
-            if (jumpCooldown > 0.0f) jumpCooldown -= 1.0f;
-            float threshold = fmaxf(bg * 0.4f / state.jumpSensitivity, 0.0008f);
-            if (delta > threshold && peak > 0.002f && jumpCooldown <= 0.0f) {
-                if (state.jumpOnGradient && state.colorMode == ColorMode::RandomGradient) {
-                    randomizeGradient(state, rng);
-                } else {
-                    state.colorMode = ColorMode::RandomSolid;
-                    state.randomSolid = randomColor(rng, state.colorBrightness);
-                }
-                jumpCooldown = 12.0f;
-            }
-        }
+            fft::computeMagnitudeSpectrum(sampleBuffer.data(), FFT_SIZE, magnitudes);
 
-        // --- D key: spectral difference detection (most different sound) ---
-        if (state.diffColor) {
-            if (!diffRefInit) {
-                diffRefMag = magnitudes;
-                diffRefInit = true;
-            }
-            float specDiff = 0.0f;
-            size_t nBins = std::min(magnitudes.size(), diffRefMag.size());
-            for (size_t i = 0; i < nBins; ++i) {
-                float d = fabsf(magnitudes[i] - diffRefMag[i]);
-                specDiff += d;
-                diffRefMag[i] += 0.02f * (magnitudes[i] - diffRefMag[i]);
-            }
-            diffBg += 0.02f * (specDiff - diffBg);
-            float dBg = fmaxf(diffBg, 0.001f);
-            float dDelta = specDiff - diffLastPeak;
-            diffLastPeak = diffLastPeak * 0.5f + specDiff * 0.5f;
-            if (diffCooldown > 0.0f) diffCooldown -= 1.0f;
-            float dThresh = fmaxf(dBg * 0.4f / state.diffSensitivity, 0.005f);
-            if (dDelta > dThresh && diffCooldown <= 0.0f) {
-                if (state.jumpOnGradient && state.colorMode == ColorMode::RandomGradient) {
-                    randomizeGradient(state, rng);
-                } else {
-                    state.colorMode = ColorMode::RandomSolid;
-                    state.randomSolid = randomColor(rng, state.colorBrightness);
+            if (state.jumpColor) {
+                float peak = 0.0f;
+                for (size_t i = 0; i < FFT_SIZE; ++i) {
+                    float absVal = fabsf(sampleBuffer[i]);
+                    if (absVal > peak) peak = absVal;
                 }
-                diffCooldown = 12.0f;
+                jumpBg += 0.02f * (peak - jumpBg);
+                float bg = fmaxf(jumpBg, 0.0001f);
+                float delta = peak - jumpLastPeak;
+                jumpLastPeak = jumpLastPeak * 0.5f + peak * 0.5f;
+                if (jumpCooldown > 0.0f) jumpCooldown -= 1.0f;
+                float threshold = fmaxf(bg * 0.4f / state.jumpSensitivity, 0.0008f);
+                if (delta > threshold && peak > 0.002f && jumpCooldown <= 0.0f) {
+                    if (state.jumpOnGradient && state.colorMode == ColorMode::RandomGradient) {
+                        randomizeGradient(state, rng);
+                    } else {
+                        state.colorMode = ColorMode::RandomSolid;
+                        state.randomSolid = randomColor(rng, state.colorBrightness);
+                    }
+                    jumpCooldown = 12.0f;
+                }
+            }
+
+            // --- D key: spectral difference detection (most different sound) ---
+            if (state.diffColor) {
+                if (!diffRefInit) {
+                    diffRefMag = magnitudes;
+                    diffRefInit = true;
+                }
+                float specDiff = 0.0f;
+                size_t nBins = std::min(magnitudes.size(), diffRefMag.size());
+                for (size_t i = 0; i < nBins; ++i) {
+                    float d = fabsf(magnitudes[i] - diffRefMag[i]);
+                    specDiff += d;
+                    diffRefMag[i] += 0.02f * (magnitudes[i] - diffRefMag[i]);
+                }
+                diffBg += 0.02f * (specDiff - diffBg);
+                float dBg = fmaxf(diffBg, 0.001f);
+                float dDelta = specDiff - diffLastPeak;
+                diffLastPeak = diffLastPeak * 0.5f + specDiff * 0.5f;
+                if (diffCooldown > 0.0f) diffCooldown -= 1.0f;
+                float dThresh = fmaxf(dBg * 0.4f / state.diffSensitivity, 0.005f);
+                if (dDelta > dThresh && diffCooldown <= 0.0f) {
+                    if (state.jumpOnGradient && state.colorMode == ColorMode::RandomGradient) {
+                        randomizeGradient(state, rng);
+                    } else {
+                        state.colorMode = ColorMode::RandomSolid;
+                        state.randomSolid = randomColor(rng, state.colorBrightness);
+                    }
+                    diffCooldown = 12.0f;
+                }
             }
         }
 
         modes::ModeOutput output;
-        const float time = static_cast<float>(glfwGetTime());
+        const float time = static_cast<float>(glfwGetTime()) * state.simSpeed;
 
-        if (state.analogScope) {
-            output = modes::buildAnalogScope(leftBuffer, rightBuffer, state);
-        } else switch (mode) {
+        if (state.paused) {
+            output = lastOutput;
+        } else {
+            if (state.analogScope) {
+                output = modes::buildAnalogScope(leftBuffer, rightBuffer, state);
+            } else switch (mode) {
             case VisMode::TrueXY:
                 output = modes::buildTrueXY(leftBuffer, rightBuffer, state);
                 break;
             case VisMode::Oscilloscope:
-                output = modes::buildOscilloscope(sampleBuffer, state);
+                output = modes::buildMirroredDenseSpectrum(magnitudes, spectrumHeights, state);
                 break;
             case VisMode::SpectrumBars:
                 output = modes::buildSpectrumBars(magnitudes, spectrumHeights, state);
@@ -3826,27 +4766,92 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             case VisMode::DenseSpectrum:
                 output = modes::buildDenseSpectrum(magnitudes, denseHeights, state);
                 break;
-            case VisMode::CircularSpectrumFilled:
-                output = modes::buildCircularSpectrumFilled(magnitudes, circularFilledHeights, state, time);
+            case VisMode::CircularMesh:
+                output = modes::buildCircularMesh(magnitudes, smoothedHeights, state);
                 break;
             case VisMode::PulseRings:
                 output = modes::buildPulseRings(magnitudes, pulseBands, state, time);
                 break;
+            case VisMode::ParticleField:
+                output = modes::buildParticleField(magnitudes, smoothedColumns, state);
+                break;
+            case VisMode::ParticleGrid:
+                output = modes::buildParticleGrid(magnitudes, smoothedColumns, state);
+                break;
+            case VisMode::LedBars:
+                output = modes::buildLedBars(magnitudes, smoothedHeights, state);
+                break;
+            case VisMode::CircularSpectrumFilled:
+                output = modes::buildCircularSpectrumFilled(magnitudes, circularFilledHeights, state, time);
+                break;
+            case VisMode::DenseSpectrumMirrored:
+                output = modes::buildDenseSpectrum(magnitudes, denseHeights, state);
+                break;
+            case VisMode::OscilloscopeLegacy:
+                output = modes::buildOscilloscope(sampleBuffer, state);
+                break;
         }
+        } // end else (!paused): build mode output
+
+        // Generate shadow from fill geometry
+        if (state.shadowEnabled && !output.fillVertices.empty() && state.bloom) {
+            const float sxOff = state.shadowOffsetX;
+            const float syOff = state.shadowOffsetY;
+            output.shadowVertices.reserve(output.fillVertices.size());
+            for (size_t vi = 0; vi < output.fillVertices.size(); vi += 6) {
+                float sx = output.fillVertices[vi] + sxOff;
+                float sy = output.fillVertices[vi + 1] + syOff;
+                float sr = output.fillVertices[vi + 2] * 0.25f;
+                float sg = output.fillVertices[vi + 3] * 0.25f;
+                float sb = output.fillVertices[vi + 4] * 0.25f;
+                float minL = 0.08f;
+                sr = std::max(sr, minL); sg = std::max(sg, minL); sb = std::max(sb, minL);
+                float sa = std::min(output.fillVertices[vi + 5] * 0.5f, 0.5f);
+                output.shadowVertices.push_back(sx); output.shadowVertices.push_back(sy);
+                output.shadowVertices.push_back(sr); output.shadowVertices.push_back(sg); output.shadowVertices.push_back(sb);
+                output.shadowVertices.push_back(sa);
+            }
+        } // end else (!paused): build+shadow
+        if (!state.paused) lastOutput = output;
 
         // --- Render ---
         const bool useMsaa = state.antiAliasing && msaaReady;
         glBindFramebuffer(GL_FRAMEBUFFER, useMsaa ? msaaFBO : 0);
         glViewport(0, 0, fbWidth, fbHeight);
 
-        glClearColor(0.02f, 0.02f, 0.04f, 1.0f);
+        glClearColor(state.backgroundColor.r, state.backgroundColor.g, state.backgroundColor.b, state.transparentFb ? 0.0f : 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
         shader.use();
         shader.setFloat("uZoom", state.zoom);
+        shader.setFloat("uPointScale", 1.0f);
         shader.setFloat("uBloomIntensity", state.bloom ? state.bloomIntensity : 0.0f);
+        shader.setInt("uBloomRings", 0);
+        shader.setVec2("uViewportSize", static_cast<float>(fbWidth), static_cast<float>(fbHeight));
 
-        if (!output.fillVertices.empty()) {
+        const bool oscilloscopeMode = mode == VisMode::TrueXY ||
+                                       mode == VisMode::MirroredWaveform ||
+                                       mode == VisMode::CircularOscilloscope ||
+                                       mode == VisMode::Lissajous ||
+                                       mode == VisMode::OscilloscopeLegacy ||
+                                       state.analogScope;
+        const bool skipFill  = (state.particlesOnly && !oscilloscopeMode) || state.linesOnly;
+        const bool skipLines = (state.particlesOnly && !oscilloscopeMode) || (state.barsOnly && !output.fillVertices.empty());
+        const bool skipGlow  = state.particlesOnly && !oscilloscopeMode;
+
+        // Shadow pass (before fill)
+        if (!output.shadowVertices.empty() && !skipFill) {
+            glBindBuffer(GL_ARRAY_BUFFER, shadowVBO);
+            glBufferData(GL_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(output.shadowVertices.size() * sizeof(float)),
+                         output.shadowVertices.data(), GL_DYNAMIC_DRAW);
+            glBindVertexArray(shadowVAO);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            shader.setInt("uIsPoint", 0);
+            shader.setFloat("uAlpha", 0.5f);
+            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(output.shadowVertices.size() / VERTEX_FLOATS));
+        }
+        if (!output.fillVertices.empty() && !skipFill) {
             glBindBuffer(GL_ARRAY_BUFFER, fillVBO);
             glBufferData(GL_ARRAY_BUFFER,
                          static_cast<GLsizeiptr>(output.fillVertices.size() * sizeof(float)),
@@ -3859,7 +4864,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(output.fillVertices.size() / VERTEX_FLOATS));
         }
 
-        if (!output.glowVertices.empty()) {
+        if (!output.glowVertices.empty() && !skipGlow && state.bloomSteps == 0) {
             glBindBuffer(GL_ARRAY_BUFFER, glowVBO);
             glBufferData(GL_ARRAY_BUFFER,
                          static_cast<GLsizeiptr>(output.glowVertices.size() * sizeof(float)),
@@ -3872,7 +4877,7 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(output.glowVertices.size() / VERTEX_FLOATS));
         }
 
-        if (!output.lineVertices.empty()) {
+        if (!output.lineVertices.empty() && !skipLines) {
             glBindBuffer(GL_ARRAY_BUFFER, lineVBO);
             glBufferData(GL_ARRAY_BUFFER,
                          static_cast<GLsizeiptr>(output.lineVertices.size() * sizeof(float)),
@@ -3882,33 +4887,117 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             shader.setInt("uIsPoint", output.linePoints ? 1 : 0);
 
             if (output.linePoints) {
+                // Crisp points
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 shader.setFloat("uAlpha", 1.0f);
                 for (const auto& seg : output.lineSegments) {
                     glDrawArrays(GL_POINTS, seg.first, seg.count);
                 }
+                // Additive glow pass for points — larger size via uPointScale
+                shader.setFloat("uPointScale", 3.0f);
+                shader.setFloat("uAlpha", 0.18f);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                for (const auto& seg : output.lineSegments) {
+                    glDrawArrays(GL_POINTS, seg.first, seg.count);
+                }
+                shader.setFloat("uPointScale", 1.0f);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                shader.setFloat("uAlpha", 1.0f);
             } else {
-                float glowWidth = 6.0f;
-                float glowAlpha = 0.25f;
-                if (state.bloom) {
-                    glowWidth *= (1.0f + state.bloomSize * 2.0f);
-                    glowAlpha *= state.bloomIntensity;
+                // Geometry-based glow — glLineWidth is clamped to 1 on most GL drivers
+                if (output.lineGlow) {
+                    float gScale = 0.0015f;
+                    float gAlpha = 0.35f;
+                    if (state.bloom) {
+                        gScale *= (1.0f + state.bloomSize * 2.0f);
+                        gAlpha *= state.bloomIntensity;
+                    }
+                    glBindBuffer(GL_ARRAY_BUFFER, lineVBO);
+                    float* verts = static_cast<float*>(glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY));
+                    if (verts) {
+                        std::vector<float> gv;
+                        auto push = [&](float x, float y, float r, float g, float b) {
+                            gv.push_back(x); gv.push_back(y);
+                            gv.push_back(r); gv.push_back(g); gv.push_back(b);
+                            gv.push_back(1.0f);
+                        };
+                        const bool isLoop = output.linePrimitive == GL_LINE_LOOP;
+                        for (const auto& seg : output.lineSegments) {
+                            int n = seg.count;
+                            for (int i = 0; i + 1 < n; ++i) {
+                                float* a = verts + (seg.first + i) * 6;
+                                float* b = verts + (seg.first + i + 1) * 6;
+                                float ax = a[0], ay = a[1];
+                                float bx = b[0], by = b[1];
+                                float r = a[2], g = a[3], bl = a[4];
+                                float dx = bx - ax, dy = by - ay;
+                                float len = std::sqrt(dx * dx + dy * dy);
+                                if (len < 1e-6f) continue;
+                                float nx = -dy / len * gScale;
+                                float ny =  dx / len * gScale;
+                                push(ax - nx, ay - ny, r, g, bl);
+                                push(ax + nx, ay + ny, r, g, bl);
+                                push(bx + nx, by + ny, r, g, bl);
+                                push(bx - nx, by - ny, r, g, bl);
+                            }
+                            // LINE_LOOP closing edge: last vertex back to first
+                            if (isLoop && n > 2) {
+                                float* a = verts + (seg.first + n - 1) * 6;
+                                float* b = verts + seg.first * 6;
+                                float ax = a[0], ay = a[1];
+                                float bx = b[0], by = b[1];
+                                float r = a[2], g = a[3], bl = a[4];
+                                float dx = bx - ax, dy = by - ay;
+                                float len = std::sqrt(dx * dx + dy * dy);
+                                if (len >= 1e-6f) {
+                                    float nx = -dy / len * gScale;
+                                    float ny =  dx / len * gScale;
+                                    push(ax - nx, ay - ny, r, g, bl);
+                                    push(ax + nx, ay + ny, r, g, bl);
+                                    push(bx + nx, by + ny, r, g, bl);
+                                    push(bx - nx, by - ny, r, g, bl);
+                                }
+                            }
+                        }
+                        glUnmapBuffer(GL_ARRAY_BUFFER);
+                        if (!gv.empty()) {
+                            glBindBuffer(GL_ARRAY_BUFFER, glowVBO);
+                            glBufferData(GL_ARRAY_BUFFER, gv.size() * sizeof(float), gv.data(), GL_DYNAMIC_DRAW);
+                            glBindVertexArray(glowVAO);
+                            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                            shader.setInt("uIsPoint", 0);
+                            shader.setFloat("uAlpha", gAlpha);
+                            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(gv.size() / 6));
+                        }
+                    }
                 }
 
+                // Crisp line on top
+                glBindVertexArray(lineVAO);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glLineWidth(output.lineWidth);
+                shader.setFloat("uAlpha", 1.0f);
                 for (const auto& seg : output.lineSegments) {
-                    if (output.lineGlow) {
-                        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-                        glLineWidth(glowWidth);
-                        shader.setFloat("uAlpha", glowAlpha);
-                        glDrawArrays(output.linePrimitive, seg.first, seg.count);
-                    }
-
-                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                    glLineWidth(output.lineWidth);
-                    shader.setFloat("uAlpha", 1.0f);
                     glDrawArrays(output.linePrimitive, seg.first, seg.count);
                 }
             }
+        }
+
+        // Bloom balls pass
+        if (!output.tipVertices.empty() && state.bloom) {
+            glBindBuffer(GL_ARRAY_BUFFER, tipVBO);
+            glBufferData(GL_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(output.tipVertices.size() * sizeof(float)),
+                         output.tipVertices.data(), GL_DYNAMIC_DRAW);
+            glBindVertexArray(tipVAO);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            shader.setInt("uIsPoint", 1);
+            shader.setFloat("uAlpha", 0.8f);
+            shader.setInt("uBloomRings", state.bloomRings);
+            shader.setInt("uBloomShape", state.bloomShape);
+            glDrawArrays(GL_POINTS, 0,
+                         static_cast<GLsizei>(output.tipVertices.size() / VERTEX_FLOATS));
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         }
 
         glBindVertexArray(0);
@@ -3920,42 +5009,271 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
         }
 
+        // --- ImGui control panel ---
+        {
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            if (controlWindow) {
+                // Snapshot on first open
+                static bool snapTaken = false;
+                static VisState snapState;
+                static VisMode snapMode;
+                if (!snapTaken) {
+                    snapState = state;
+                    snapMode = mode;
+                    snapTaken = true;
+                }
+
+                // Rounded corners + colored decorations
+                ImGuiStyle& style = ImGui::GetStyle();
+                style.WindowRounding = 12.0f;
+                style.FrameRounding  = 8.0f;
+                style.GrabRounding   = 8.0f;
+                style.ScrollbarRounding = 8.0f;
+                style.ChildRounding  = 8.0f;
+                style.WindowBorderSize = 2.0f;
+                style.WindowTitleAlign = ImVec2(0.5f, 0.5f);
+                {
+                    Color3 decoColor = (state.colorMode == ColorMode::RandomSolid || state.gradientColors.empty())
+                        ? state.randomSolid
+                        : state.gradientColors[state.gradientColorCount > 0 ? 0 : 0];
+                    ImGui::PushStyleColor(ImGuiCol_TitleBg,        ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.85f));
+                    ImGui::PushStyleColor(ImGuiCol_TitleBgActive,  ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.95f));
+                    ImGui::PushStyleColor(ImGuiCol_Border,         ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.7f));
+                    ImGui::PushStyleColor(ImGuiCol_FrameBg,        ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.25f));
+                    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.40f));
+                    ImGui::PushStyleColor(ImGuiCol_FrameBgActive,  ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.60f));
+                    ImGui::PushStyleColor(ImGuiCol_Button,         ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.35f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.70f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.90f));
+                    ImGui::PushStyleColor(ImGuiCol_CheckMark,      ImVec4(decoColor.r, decoColor.g, decoColor.b, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_Header,         ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.25f));
+                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,  ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.55f));
+                    ImGui::PushStyleColor(ImGuiCol_HeaderActive,   ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.80f));
+                    ImGui::PushStyleColor(ImGuiCol_SliderGrab,     ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.70f));
+                    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(decoColor.r, decoColor.g, decoColor.b, 0.90f));
+                }
+
+                bool open = true;
+                ImGui::Begin("Control Panel", &open, ImGuiWindowFlags_NoCollapse);
+                ImGui::PopStyleColor(15);
+                if (!open) {
+                    // Closed via X button → restore snapshot
+                    state = snapState;
+                    mode = snapMode;
+                    controlWindow = false;
+                    snapTaken = false;
+                }
+
+                const char* modes[] = {"TrueXY","Oscilloscope","SpectrumBars","MirroredWF",
+                                       "CircOsc","CircSpec","Lissajous","DenseSpec",
+                                       "CircMesh","PulseRings",
+                                        "SpiralGal","LedBars",
+                                       "CircFill","DenseMirr","OscLegacy"};
+                int curMode = static_cast<int>(mode);
+                if (ImGui::Combo("Mode", &curMode, modes, 15)) {
+                    mode = static_cast<VisMode>(curMode);
+                }
+                ImGui::SameLine();
+                ImGui::Checkbox("Pause", &state.paused);
+
+                { int v = static_cast<int>(state.numBars); if (ImGui::SliderInt("Bars", &v, static_cast<int>(state.minBars), static_cast<int>(state.maxBars))) { state.numBars = static_cast<size_t>(v); resizeBarVectors(state, spectrumHeights, circularSpectrumHeights, denseHeights, circularFilledHeights, smoothedColumns, smoothedHeights); } }
+                ImGui::SliderFloat("Sensitivity", &state.sensitivity, 0.1f, state.maxSensitivityLimit);
+                ImGui::SliderFloat("Zoom", &state.zoom, 0.01f, 100000.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("Wave Zoom", &state.waveZoom, 0.1f, 10.0f);
+                ImGui::SliderFloat("Wave Speed", &state.waveSpeed, 0.0f, 20.0f);
+                ImGui::SliderFloat("Limit Multiplier", &state.limitMultiplier, 0.5f, 10.0f);
+
+                ImGui::Separator();
+                ImGui::Checkbox("Bloom", &state.bloom);
+                {
+                    const char* bmodes[] = {"Bars (Glow)", "Bloom Balls"};
+                    int bm = state.bloomSteps > 0 ? 1 : 0;
+                    if (ImGui::Combo("Bloom Mode", &bm, bmodes, 2)) {
+                        if (bm == 0) state.bloomSteps = 0;
+                        else if (state.bloomSteps == 0) state.bloomSteps = 3;
+                    }
+                }
+                ImGui::SliderFloat("Bloom Intensity", &state.bloomIntensity, 0.5f, 2.5f);
+                ImGui::Checkbox("Particles-only (oscilloscope exempt)", &state.particlesOnly);
+
+                ImGui::Checkbox("Anti-Aliasing", &state.antiAliasing);
+                ImGui::SameLine();
+                ImGui::Checkbox("Glow", &state.glow);
+
+                ImGui::Checkbox("Jump Color", &state.jumpColor);
+                ImGui::SameLine();
+                ImGui::SliderFloat("Jump Sens", &state.jumpSensitivity, 0.25f, 5.0f);
+                ImGui::Checkbox("Jump on Gradient", &state.jumpOnGradient);
+
+                ImGui::Checkbox("Diff Color", &state.diffColor);
+                ImGui::SameLine();
+                ImGui::SliderFloat("Diff Sens", &state.diffSensitivity, 0.25f, 5.0f);
+
+                ImGui::Separator();
+                { int v = static_cast<int>(state.gradientColorCount); if (ImGui::SliderInt("Gradient Colors", &v, 1, 64)) state.gradientColorCount = static_cast<size_t>(v); }
+                {
+                    const char* cmodes[] = {"Normal","RandomSolid","RandomGradient"};
+                    int cm = static_cast<int>(state.colorMode);
+                    if (ImGui::Combo("Color Mode", &cm, cmodes, 3))
+                        state.colorMode = static_cast<ColorMode>(cm);
+                }
+                ImGui::ColorEdit3("Solid Color", &state.randomSolid.r);
+                for (size_t ci = 0; ci < state.gradientColorCount; ++ci) {
+                    if (ci >= state.gradientColors.size()) break;
+                    char label[32]; std::snprintf(label, sizeof(label), "Gradient %zu", ci + 1);
+                    ImGui::ColorEdit3(label, &state.gradientColors[ci].r);
+                }
+                {
+                    const char* xymodes[] = {"Scatter","LineStrip","Both","FilledTrail","GlowScatter","PhosphorTrail"};
+                    int xy = static_cast<int>(state.trueXYMode);
+                    if (ImGui::Combo("TrueXY Mode", &xy, xymodes, 6))
+                        state.trueXYMode = static_cast<TrueXYMode>(xy);
+                }
+
+                ImGui::Separator();
+                ImGui::Checkbox("Analog Scope", &state.analogScope);
+                ImGui::SliderFloat("Analog Decay", &state.analogScopeDecay, 0.5f, 40.0f);
+                ImGui::Checkbox("Line Smooth", &state.lineSmooth);
+                ImGui::SliderFloat("Line Sharpness", &state.lineSharpness, 0.25f, 5.0f);
+                { int v = static_cast<int>(state.particleCount); if (ImGui::SliderInt("Particles", &v, 1, 10000)) state.particleCount = static_cast<size_t>(v); }
+                ImGui::SliderFloat("Particle Size", &state.particleSize, 1.0f, 50.0f);
+                ImGui::SliderFloat("Sim Speed", &state.simSpeed, 0.0f, 10.0f);
+
+                ImGui::Separator();
+                ImGui::Text("Bloom Balls");
+                ImGui::SliderInt("Bloom Steps", &state.bloomSteps, 1, 20);
+                ImGui::SliderInt("Bloom Rings", &state.bloomRings, 0, 100);
+                ImGui::SliderFloat("Ball Intensity", &state.bloomBallIntensity, 1.0f, 600.0f);
+                if (mode == VisMode::SpectrumBars || mode == VisMode::DenseSpectrum ||
+                    mode == VisMode::CircularSpectrum || mode == VisMode::CircularSpectrumFilled ||
+                    mode == VisMode::DenseSpectrumMirrored ||
+                    mode == VisMode::ParticleField || mode == VisMode::LedBars)
+                    ImGui::SliderFloat("Ball Amount", &state.bloomBallAmount, 0.1f, 5.0f);
+                { const char* bshapes[] = {"Ball","Square","Triangle"}; ImGui::Combo("Bloom Shape", &state.bloomShape, bshapes, 3); }
+                { float bgc[3] = {state.bgBloomColor.r, state.bgBloomColor.g, state.bgBloomColor.b}; if (ImGui::ColorEdit3("BG Color", bgc)) { state.bgBloomColor.r = bgc[0]; state.bgBloomColor.g = bgc[1]; state.bgBloomColor.b = bgc[2]; } }
+                ImGui::SliderFloat("BG Intensity", &state.bgBloomIntensity, 1.0f, 60.0f);
+                ImGui::SliderFloat("Center Sensitivity", &state.centerSensitivity, 0.0f, 10.0f);
+                if (mode == VisMode::ParticleField)
+                    ImGui::SliderFloat("Galaxy Distance", &state.spiralGalaxyDistance, 0.1f, 5.0f);
+
+                ImGui::Separator();
+                ImGui::Text("Shadow");
+                ImGui::Checkbox("Enabled", &state.shadowEnabled);
+                ImGui::SliderFloat("Offset Y", &state.shadowOffsetY, -0.5f, 0.5f);
+                ImGui::SliderFloat("Size", &state.shadowSize, 0.01f, 0.5f);
+
+                // Current values display
+                if (ImGui::CollapsingHeader("Values", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::Text("Mode: %s", modeName(mode));
+                    ImGui::Text("numBars: %zu", state.numBars);
+                    ImGui::Text("sensitivity: %.3f", state.sensitivity);
+                    ImGui::Text("zoom: %.3f", state.zoom);
+                    ImGui::Text("waveZoom: %.3f", state.waveZoom);
+                    ImGui::Text("waveSpeed: %.3f", state.waveSpeed);
+                    ImGui::Text("limitMultiplier: %.3f", state.limitMultiplier);
+                    ImGui::Text("bloom: %s", state.bloom ? "on" : "off");
+                    ImGui::Text("bloomIntensity: %.3f", state.bloomIntensity);
+                    ImGui::Text("antiAliasing: %s", state.antiAliasing ? "on" : "off");
+                    ImGui::Text("glow: %s", state.glow ? "on" : "off");
+                    ImGui::Text("jumpColor: %s", state.jumpColor ? "on" : "off");
+                    ImGui::Text("jumpOnGradient: %s", state.jumpOnGradient ? "on" : "off");
+                    ImGui::Text("jumpSensitivity: %.3f", state.jumpSensitivity);
+                    ImGui::Text("diffColor: %s", state.diffColor ? "on" : "off");
+                    ImGui::Text("diffSensitivity: %.3f", state.diffSensitivity);
+                    ImGui::Text("gradientColorCount: %zu", state.gradientColorCount);
+                    ImGui::Text("colorMode: %d", (int)state.colorMode);
+                    ImGui::Text("trueXYMode: %d", (int)state.trueXYMode);
+                    ImGui::Text("analogScope: %s", state.analogScope ? "on" : "off");
+                    ImGui::Text("analogScopeDecay: %.3f", state.analogScopeDecay);
+                    ImGui::Text("lineSmooth: %s", state.lineSmooth ? "on" : "off");
+                    ImGui::Text("lineSharpness: %.3f", state.lineSharpness);
+                    ImGui::Text("particleCount: %zu", state.particleCount);
+                    ImGui::Text("particleSize: %.1f", state.particleSize);
+                    ImGui::Text("barsOnly: %s  linesOnly: %s  particlesOnly: %s",
+                        state.barsOnly ? "on" : "off",
+                        state.linesOnly ? "on" : "off",
+                        state.particlesOnly ? "on" : "off");
+                    ImGui::Text("simSpeed: %.2f  bloomShape: %s  centerSens: %.2f  galDist: %.2f",
+                        state.simSpeed,
+                        (state.bloomShape == 0 ? "ball" : state.bloomShape == 1 ? "square" : "triangle"),
+                        state.centerSensitivity,
+                        state.spiralGalaxyDistance);
+                    ImGui::Text("inputMode: %d", (int)state.inputMode);
+                    ImGui::Text("bloomSteps: %d", state.bloomSteps);
+                    ImGui::Text("bloomRings: %d", state.bloomRings);
+                    ImGui::Text("bloomBallIntensity: %.1f", state.bloomBallIntensity);
+                    ImGui::Text("windowOpacity: %.2f", state.windowOpacity);
+                }
+
+                // Global/compile-time config
+                ImGui::Separator();
+                ImGui::Text("Globals (some require restart)");
+                { int v = static_cast<int>(state.minBars); if (ImGui::SliderInt("Min Bars", &v, 1, 64)) state.minBars = static_cast<size_t>(v); }
+                { int v = static_cast<int>(state.maxBars); if (ImGui::SliderInt("Max Bars", &v, 64, 8192)) state.maxBars = static_cast<size_t>(v); }
+                { int v = static_cast<int>(state.denseBarCap); if (ImGui::SliderInt("Dense Bar Cap", &v, 64, 16384)) state.denseBarCap = static_cast<size_t>(v); }
+                ImGui::SliderInt("MSAA Samples", &state.msaaSamples, 1, 8);
+                ImGui::SliderFloat("Window Opacity", &state.windowOpacity, 0.1f, 1.0f);
+
+                ImGui::Separator();
+                ImGui::Checkbox("Transparent Background", &state.transparentFb);
+                ImGui::ColorEdit3("Background Color", &state.backgroundColor.r);
+                ImGui::Separator();
+                static bool fullscreen = false;
+                static bool noDecoration = false;
+                if (ImGui::Button(fullscreen ? "Windowed" : "Fullscreen")) {
+                    fullscreen = !fullscreen;
+                    if (fullscreen) {
+                        GLFWmonitor* mon = glfwGetPrimaryMonitor();
+                        const GLFWvidmode* vm = glfwGetVideoMode(mon);
+                        glfwSetWindowMonitor(window, mon, 0, 0, vm->width, vm->height, vm->refreshRate);
+                    } else {
+                        glfwSetWindowMonitor(window, nullptr, 100, 100, WINDOW_WIDTH, WINDOW_HEIGHT, 0);
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(noDecoration ? "Decorated" : "No Decoration")) {
+                    noDecoration = !noDecoration;
+                    glfwSetWindowAttrib(window, GLFW_DECORATED, noDecoration ? GLFW_FALSE : GLFW_TRUE);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Exit")) {
+                    glfwSetWindowShouldClose(window, true);
+                }
+
+                if (ImGui::Button("Revert & Close")) {
+                    state = snapState;
+                    mode = snapMode;
+                    controlWindow = false;
+                    snapTaken = false;
+                }
+
+                ImGui::End();
+            } else {
+                // Reset snapshot when panel is closed externally
+                static bool wasOpen = false;
+                if (wasOpen) {
+                    // snapshot was already restored above; just reset
+                }
+                wasOpen = false;
+            }
+
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        }
+
         glfwSwapBuffers(window);
         glfwPollEvents();
 
+        // --- Read-only value overlay (TUI) ---
         if (tuiEnabled) {
             static double lastTuiFrame = 0.0;
             double now = glfwGetTime();
             if (now - lastTuiFrame >= 0.2) {
                 lastTuiFrame = now;
-#ifndef _WIN32
-                struct winsize ws;
-                if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
-                    termWidth = ws.ws_col;
-                    termHeight = ws.ws_row;
-                }
-#endif
-                if (termWidth < 60 || termHeight < 12) {
-                    tuiEnabled = false;
-                    std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l";
-#ifndef _WIN32
-                    tcflush(STDIN_FILENO, TCIFLUSH);
-#endif
-                    continue;
-                }
-                int hh = static_cast<int>(now) / 3600;
-                int mm = (static_cast<int>(now) % 3600) / 60;
-                int ss = static_cast<int>(now) % 60;
-                static double fpsLast = 0.0;
-                static float fpsVal = 60.0f;
-                if (now - fpsLast > 0.5) {
-                    fpsVal = static_cast<float>(1.0 / std::max(now - fpsLast, 0.001));
-                    fpsLast = now;
-                }
-
-                auto tag = [](bool v) -> const char* {
-                    return v ? "\033[32m\xe2\x97\x8f\033[0m" : "\033[90m\xe2\x97\x8b\033[0m";
-                };
+                auto on  = [](bool v) { return v ? "\033[32m\xe2\x97\x8f\033[0m" : "\033[90m\xe2\x97\x8b\033[0m"; };
                 auto xym = [](TrueXYMode m) -> const char* {
                     switch (m) { case TrueXYMode::Scatter: return "Scat"; case TrueXYMode::LineStrip: return "Line";
                     case TrueXYMode::Both: return "Both"; case TrueXYMode::FilledTrail: return "Fill";
@@ -3965,120 +5283,110 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
                     switch (m) { case ColorMode::Normal: return "Nrm"; case ColorMode::RandomSolid: return "Sol";
                     case ColorMode::RandomGradient: return "Grd"; } return "?";
                 };
-                auto mn = [](VisMode m) -> const char* {
-                    switch (m) { case VisMode::TrueXY: return "XY"; case VisMode::Oscilloscope: return "Osc";
-                    case VisMode::SpectrumBars: return "Bar"; case VisMode::MirroredWaveform: return "Mir";
-                    case VisMode::CircularOscilloscope: return "COs"; case VisMode::CircularSpectrum: return "CSp";
-                    case VisMode::Lissajous: return "Lis"; case VisMode::DenseSpectrum: return "Den";
-                    case VisMode::CircularSpectrumFilled: return "CFi"; case VisMode::PulseRings: return "Pls"; } return "?";
+                std::cout << "\033[s\033[1;1H\033[2J"; // save, go home, clear
+                std::cout << "\033[1;36m \xe2\x96\x88 Chills \xe2\x96\x88\033[0m \033[1;37m" << modeName(mode) << "\033[0m\n";
+                std::cout << "\033[33m Bars:\033[0m " << state.numBars
+                          << "  \033[33mSens:\033[0m " << state.sensitivity
+                          << "  \033[33mZoom:\033[0m " << state.zoom << "\n";
+                std::cout << "\033[33m WZoom:\033[0m " << state.waveZoom
+                          << "  \033[33mWSpeed:\033[0m " << state.waveSpeed
+                          << "  \033[33mB-AMU:\033[0m " << state.limitMultiplier << "\n";
+                std::cout << " " << on(state.bloom)      << " \033[32mBloom\033[0m"
+                          << " " << on(state.antiAliasing) << " \033[32mAA\033[0m"
+                          << " " << on(state.glow)       << " \033[32mGlow\033[0m"
+                          << " " << on(state.jumpColor)  << " \033[32mJump\033[0m\n";
+                std::cout << " " << on(state.jumpOnGradient) << " \033[32mJGrad\033[0m"
+                          << " " << on(state.diffColor)  << " \033[32mDiff\033[0m"
+                          << " " << on(state.analogScope) << " \033[32mAScope\033[0m"
+                          << " " << on(state.lineSmooth) << " \033[32mSmooth\033[0m\n";
+                std::cout << " \033[36mSens:\033[0m " << state.jumpSensitivity
+                          << "  \033[36mDSens:\033[0m " << state.diffSensitivity
+                          << "  \033[36mGrad:\033[0m " << state.gradientColorCount
+                          << " " << cm(state.colorMode)
+                          << "  \033[36mXY:\033[0m " << xym(state.trueXYMode) << "\n";
+                std::cout << " \033[36mSharp:\033[0m " << state.lineSharpness
+                          << "  \033[36mBlmInt:\033[0m " << state.bloomIntensity
+                          << "  \033[36mPrtcls:\033[0m " << state.particleCount
+                          << "  \033[36mBall:\033[0m " << state.bloomBallIntensity << "\n";
+                std::cout << " \033[36mBSteps:\033[0m " << state.bloomSteps
+                          << "  \033[36mBRings:\033[0m " << state.bloomRings
+                          << "  \033[36mOpacity:\033[0m " << state.windowOpacity
+                          << "  \033[36mPrtSize:\033[0m " << state.particleSize
+                          << "  \033[36mSpeed:\033[0m " << state.simSpeed << "\n";
+                auto inputLabel = [](InputMode m) -> const char* {
+                    switch (m) { case InputMode::Microphone: return "Mic"; case InputMode::SystemAudio: return "Sys"; case InputMode::Both: return "Both"; case InputMode::Reduction: return "Red"; } return "?";
                 };
-
-                int cw = termWidth;
-                std::cout << "\033[1;1H";
-
-                // ── Title bar ──
-                std::cout << "\033[1;36m\xe2\x95\x8e\xe2\x95\x90\xe2\x95\x90"
-                    " \033[1;37mChills\033[1;36m \xe2\x95\x90\xe2\x95\x90 "
-                    << mn(mode) << " [" << int(mode) << "]"
-                    << " \xe2\x95\x90\xe2\x95\x90 "
-                    << (hh < 10 ? "0" : "") << hh << ":" << (mm < 10 ? "0" : "") << mm
-                    << ":" << (ss < 10 ? "0" : "") << ss
-                    << " \xe2\x95\x90\xe2\x95\x90 " << int(fpsVal) << " FPS\033[1;36m";
-                for (int i = 0; i < cw - 46; ++i) std::cout << "\xe2\x95\x90";
-                std::cout << "\xe2\x95\x8f\033[0m\n";
-
-                // ── Compact parameter rows ──
-                auto pRow = [&](int idx, const char* label, const std::string& val, bool sel) {
-                    if (sel) std::cout << "\033[48;5;236m";
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m"
-                              << (sel ? "\033[48;5;236m\033[1;97m" : "\033[1m") << label;
-                    if (sel) std::cout << "\033[48;5;236m\033[0m\033[48;5;236m";
-                    else std::cout << "\033[0m";
-                    std::cout << " " << val;
-                    int used = 3 + static_cast<int>(strlen(label)) + 1 + static_cast<int>(val.size());
-                    if (sel) std::cout << "\033[48;5;236m";
-                    for (int i = used; i < cw - 3; ++i) std::cout << " ";
-                    if (sel) std::cout << "\033[0m";
-                    std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
-                };
-
-                // 20 params in 20 rows, no section headers to save space
-                auto rv = [&](int idx, const char* l, const std::string& v) { pRow(idx, l, v, tuiSelection == idx); };
-                rv(0,  "Mode",       std::to_string(int(mode)) + " " + mn(mode));
-                rv(1,  "Bars",       std::to_string(state.numBars));
-                rv(2,  "Sens",       std::to_string(state.sensitivity));
-                rv(3,  "Zoom",       std::to_string(state.zoom));
-                rv(4,  "WZoom",      std::to_string(state.waveZoom));
-                rv(5,  "WSpeed",     std::to_string(state.waveSpeed));
-                rv(6,  "Bloom",      std::string(tag(state.bloom)) + "  Int " + std::to_string(state.bloomIntensity));
-                rv(7,  "AA",         std::string(tag(state.antiAliasing)));
-                rv(8,  "Jump",       std::string(tag(state.jumpColor)) + "  Sens " + std::to_string(state.jumpSensitivity));
-                rv(9,  "JGrad",      std::string(tag(state.jumpOnGradient)));
-                rv(10, "Diff",       std::string(tag(state.diffColor)) + "  Sens " + std::to_string(state.diffSensitivity));
-                rv(11, "B-AMU",      std::to_string(state.limitMultiplier));
-                rv(12, "TrueXY",     xym(state.trueXYMode));
-                rv(13, "Grad",       std::to_string(state.gradientColorCount) + " " + cm(state.colorMode));
-                rv(14, "AScope",     std::string(tag(state.analogScope)));
-                rv(15, "Smooth",     std::string(tag(state.lineSmooth)) + "  Sharp " + std::to_string(state.lineSharpness));
-
-                int usedRows = 17; // title + 16 param rows
-                int remain = termHeight - usedRows - 1;
-
-                // ── Mini spectrum (only if space) ──
-                if (remain >= 4 && !magnitudes.empty()) {
-                    std::cout << "\033[1;36m\xe2\x95\xa0";
-                    for (int i = 0; i < cw - 4; ++i) std::cout << "\xe2\x95\x90";
-                    std::cout << "\xe2\x95\xa3\033[0m\n";
-                    int specH = std::min(remain - 1, 6);
-                    size_t nBins = magnitudes.size();
-                    for (int r = 0; r < specH; ++r) {
-                        float val = 0.0f;
-                        size_t bi = static_cast<size_t>(static_cast<float>(r) / static_cast<float>(specH) * static_cast<float>(nBins));
-                        bi = std::min(bi, nBins - 1);
-                        val = std::clamp(magnitudes[bi] * 100.0f, 0.0f, 1.0f);
-                        int bw = std::max(1, cw - 7);
-                        int filled = static_cast<int>(val * static_cast<float>(bw));
-                        std::cout << "\033[36m\xe2\x95\x91\033[0m \033[32m";
-                        for (int i = 0; i < bw; ++i)
-                            std::cout << (i < filled ? "\xe2\x96\x88" : "\xe2\x96\x91");
-                        std::cout << "\033[0m \033[36m\xe2\x95\x91\033[0m\n";
-                    }
-                    usedRows += 1 + specH;
-                    remain = termHeight - usedRows - 1;
-                }
-
-                // ── Keybinds (if space) ──
-                if (remain >= 2) {
-                    std::cout << "\033[1;36m\xe2\x95\xa0";
-                    for (int i = 0; i < cw - 4; ++i) std::cout << "\xe2\x95\x90";
-                    std::cout << "\xe2\x95\xa3\033[0m\n";
-                    usedRows++;
-
-                    auto kRow = [&](const std::string& txt) {
-                        if (usedRows >= termHeight - 1) { usedRows++; return; }
-                        std::cout << "\033[36m\xe2\x95\x91\033[0m " << txt;
-                        int len = 2 + static_cast<int>(txt.size());
-                        for (int i = len; i < cw - 2; ++i) std::cout << " ";
-                        std::cout << "\033[36m\xe2\x95\x91\033[0m\n";
-                        usedRows++;
-                    };
-                    kRow("\xe2\x86\x91\xe2\x86\x93 Nav  \xe2\x86\x90\xe2\x86\x92/Enter Adj  Esc/T Exit  0-9 Mode");
-                    kRow("J Jump  D Diff  R Sol  G Grad  H AScope  L Bloom  A AA  K Smooth");
-                    if (remain >= 4)
-                        kRow("Q Sc W Ln E Bt I Fi O Gl P Ph  / J+ \\ J-  U D+ Y D-  V+ N-");
-                    if (remain >= 5)
-                        kRow("M Mic  S Sys  , . GradCt  [ ] BlmSz  B AMU  -= Zoom");
-                }
-
-                // ── Bottom border ──
-                if (usedRows < termHeight) {
-                    std::cout << "\033[1;36m\xe2\x95\x9a";
-                    for (int i = 0; i < std::min(cw - 4, termWidth - 2); ++i) std::cout << "\xe2\x95\x90";
-                    std::cout << "\xe2\x95\x9d\033[0m\n";
-                }
-
-                std::cout << "\033[J";
+                std::cout << " \033[36mInput:\033[0m " << inputLabel(state.inputMode)
+                          << "  \033[36mBarsOnly:\033[0m " << (state.barsOnly ? "\033[32mON\033[0m" : "\033[90mOFF\033[0m")
+                          << "  \033[36mLinesOnly:\033[0m " << (state.linesOnly ? "\033[32mON\033[0m" : "\033[90mOFF\033[0m")
+                          << "  \033[36mParticlesOnly:\033[0m " << (state.particlesOnly ? "\033[32mON\033[0m" : "\033[90mOFF\033[0m") << "\n";
+                std::cout << "\033[1;30m T=hide  C=control-panel  M=mic S=sys B=both `=bars  L=lines  P=particles  0-9=mode  Shift+7/8=10/11  Shift+1=12  Shift+2=13  Esc=exit\033[0m\n";
+                std::cout << "\033[u";
                 std::cout.flush();
+            }
+        }
+
+        // --- Detect state change and debounce save ---
+        bool state_changed = (previous_loop_mode != mode ||
+                              previous_loop_state.numBars != state.numBars ||
+                              previous_loop_state.sensitivity != state.sensitivity ||
+                              previous_loop_state.zoom != state.zoom ||
+                              previous_loop_state.waveZoom != state.waveZoom ||
+                              previous_loop_state.waveSpeed != state.waveSpeed ||
+                              previous_loop_state.bloom != state.bloom ||
+                              previous_loop_state.bloomIntensity != state.bloomIntensity ||
+                              previous_loop_state.limitMultiplier != state.limitMultiplier ||
+                              previous_loop_state.antiAliasing != state.antiAliasing ||
+                              previous_loop_state.glow != state.glow ||
+                              previous_loop_state.jumpColor != state.jumpColor ||
+                              previous_loop_state.jumpOnGradient != state.jumpOnGradient ||
+                              previous_loop_state.jumpSensitivity != state.jumpSensitivity ||
+                              previous_loop_state.diffColor != state.diffColor ||
+                              previous_loop_state.diffSensitivity != state.diffSensitivity ||
+                              previous_loop_state.gradientColorCount != state.gradientColorCount ||
+                              previous_loop_state.trueXYMode != state.trueXYMode ||
+                              previous_loop_state.analogScope != state.analogScope ||
+                              previous_loop_state.particleCount != state.particleCount ||
+                               previous_loop_state.lineSmooth != state.lineSmooth ||
+                               previous_loop_state.lineSharpness != state.lineSharpness ||
+                               previous_loop_state.colorMode != state.colorMode ||
+                               previous_loop_state.minBars != state.minBars ||
+                               previous_loop_state.maxBars != state.maxBars ||
+                               previous_loop_state.denseBarCap != state.denseBarCap ||
+                               previous_loop_state.msaaSamples != state.msaaSamples ||
+                               previous_loop_state.analogScopeDecay != state.analogScopeDecay ||
+                               previous_loop_state.bloomSteps != state.bloomSteps ||
+                               previous_loop_state.bloomRings != state.bloomRings ||
+                               previous_loop_state.bloomBallIntensity != state.bloomBallIntensity ||
+                               previous_loop_state.windowOpacity != state.windowOpacity ||
+                               previous_loop_state.particleSize != state.particleSize ||
+                                previous_loop_state.barsOnly != state.barsOnly ||
+                                previous_loop_state.linesOnly != state.linesOnly ||
+                                previous_loop_state.particlesOnly != state.particlesOnly ||
+                                previous_loop_state.simSpeed != state.simSpeed ||
+                                previous_loop_state.bloomShape != state.bloomShape ||
+                                 previous_loop_state.centerSensitivity != state.centerSensitivity ||
+                                 previous_loop_state.inputMode != state.inputMode);
+        if (state_changed) {
+            configNeedsSave = true;
+            lastConfigModTime = glfwGetTime();
+        }
+
+        // Apply window opacity at runtime
+        {
+            static float lastOpacity = 1.0f;
+            if (state.windowOpacity != lastOpacity) {
+                lastOpacity = state.windowOpacity;
+                glfwSetWindowOpacity(window, state.windowOpacity);
+            }
+        }
+
+        if (configNeedsSave && !configSavePath.empty() && glfwGetTime() - lastConfigModTime >= 0.3) {
+            writeConfigFile(configSavePath, state, mode);
+            configNeedsSave = false;
+            struct stat res_stat;
+            if (stat(configSavePath.c_str(), &res_stat) == 0) {
+                lastMtime = res_stat.st_mtime;
             }
         }
     }
@@ -4091,6 +5399,10 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
     glDeleteVertexArrays(1, &fillVAO);
     glDeleteBuffers(1, &glowVBO);
     glDeleteVertexArrays(1, &glowVAO);
+    glDeleteBuffers(1, &tipVBO);
+    glDeleteVertexArrays(1, &tipVAO);
+    glDeleteBuffers(1, &shadowVBO);
+    glDeleteVertexArrays(1, &shadowVAO);
 
     if (msaaReady) {
         glDeleteRenderbuffers(1, &msaaColorRBO);
@@ -4099,6 +5411,12 @@ data and state, returns a ModeOutput with vertex data ready for OpenGL.
 
     // Restore terminal state on exit
     std::cout << "\033[?25h\033[?1006l\033[?1000l\033[?1047l";
+
+    // Shutdown ImGui
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;

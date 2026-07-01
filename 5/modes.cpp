@@ -3,6 +3,7 @@
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <utility>
 
 namespace {
@@ -73,13 +74,13 @@ float sampleInterpolated(const std::vector<float>& magnitudes, float binIndex) {
     return magnitudes[i0] * (1.0f - frac) + magnitudes[i1] * frac;
 }
 
+// Logarithmic bin range: distribute bars across the frequency spectrum so low
+// frequencies get more bars (higher resolution) and high frequencies get fewer.
+// freqLow ≈ 30 Hz (bin ~5), freqHigh ≈ 18 kHz (bin ~1536 at 48kHz/4096)
 std::pair<size_t, size_t> linearBinRange(size_t numBins, size_t numGroups, size_t groupIndex) {
-    size_t binStart =  groupIndex       * numBins / numGroups;
-    size_t binEnd   = (groupIndex + 1) * numBins / numGroups;
-    if (binStart >= numBins) binStart = numBins - 1;
-    if (binEnd > numBins) binEnd = numBins;
-    if (binEnd <= binStart) binEnd = binStart + 1;
-    return {binStart, binEnd};
+    const size_t binStart =  groupIndex       * numBins / numGroups;
+    const size_t binEnd   = (groupIndex + 1)  * numBins / numGroups;
+    return {std::min(binStart, numBins - 1), std::clamp(binEnd, binStart + 1, numBins)};
 }
 
 float groupMagnitude(const std::vector<float>& magnitudes, size_t binStart, size_t binEnd) {
@@ -173,7 +174,7 @@ modes::ModeOutput buildBarSpectrum(const std::vector<float>& magnitudes, std::ve
     out.fillVertices.reserve(numBars * 6 * 6);
     out.lineVertices.reserve(numBars * 6);
     if (state.bloom) {
-        out.glowVertices.reserve(numBars * 12 * 6);
+        out.glowVertices.reserve((state.bloomSteps > 0 ? numBars * 6 * 6 * static_cast<size_t>(state.bloomSteps) : numBars * 6 * 6) + 144);
     }
 
     for (size_t bar = 0; bar < numBars; ++bar) {
@@ -205,12 +206,24 @@ modes::ModeOutput buildBarSpectrum(const std::vector<float>& magnitudes, std::ve
 
         if (state.bloom) {
             appendBarGlow(out.glowVertices, x0, x1, baseline, yTop, topColor, state.bloomSize);
+
+            if (state.bloomSteps > 0) {
+                const float xc = (x0 + x1) * 0.5f;
+                int bloomCount = std::max(1, static_cast<int>(state.bloomSteps * state.bloomBallAmount));
+                for (int si = 0; si < bloomCount; ++si) {
+                    const float stepT = static_cast<float>(si + 1) / static_cast<float>(bloomCount);
+                    const float yStep = baseline + stepT * (yTop - baseline);
+                    const Color3 bc = resolveColor(state, topColor, stepT);
+                    pushVertex(out.tipVertices, xc, yStep, bc.r, bc.g, bc.b,
+                               state.bloomBallIntensity * h);
+                }
+            }
         }
     }
 
     out.linePrimitive = GL_LINE_STRIP;
     out.lineSegments  = {{0, static_cast<GLsizei>(numBars)}};
-    out.lineGlow      = true;
+    out.lineGlow = true;
     out.fillAlpha     = 1.0f;
     return out;
 }
@@ -230,6 +243,8 @@ modes::ModeOutput buildCircularBars(const std::vector<float>& magnitudes, std::v
     out.lineVertices.reserve(numBars * 6);
     if (state.bloom) {
         out.glowVertices.reserve(numBars * 6 * 6);
+        if (state.bloomSteps > 0)
+            out.tipVertices.reserve(numBars * static_cast<size_t>(state.bloomSteps) * 6);
     }
 
     for (size_t bar = 0; bar < numBars; ++bar) {
@@ -267,12 +282,26 @@ modes::ModeOutput buildCircularBars(const std::vector<float>& magnitudes, std::v
 
         if (state.bloom) {
             appendRadialGlow(out.glowVertices, a0, a1, innerRadius, outerRadius, outerColor, state.bloomSize, state.aspect);
+
+            if (state.bloomSteps > 0) {
+                const float angle = t * 2.0f * kPi;
+                int bloomCount = std::max(1, static_cast<int>(state.bloomSteps * state.bloomBallAmount));
+                for (int si = 0; si < bloomCount; ++si) {
+                    const float stepT = static_cast<float>(si + 1) / static_cast<float>(bloomCount);
+                    const float rStep = innerRadius + stepT * (outerRadius - innerRadius);
+                    const float sx = rStep * std::cos(angle) * state.aspect;
+                    const float sy = rStep * std::sin(angle);
+                    const Color3 bc = resolveColor(state, outerColor, stepT);
+                    pushVertex(out.tipVertices, sx, sy, bc.r, bc.g, bc.b,
+                               state.bloomBallIntensity * h);
+                }
+            }
         }
     }
 
     out.linePrimitive = GL_LINE_LOOP;
     out.lineSegments  = {{0, static_cast<GLsizei>(numBars)}};
-    out.lineGlow      = true;
+    out.lineGlow = true;
     out.fillAlpha     = 1.0f;
     return out;
 }
@@ -288,9 +317,9 @@ ModeOutput buildOscilloscope(const std::vector<float>& samples, const VisState& 
     const size_t n = smoothed.size();
 
     size_t displayCount = static_cast<size_t>(static_cast<float>(n) / state.waveZoom);
-    displayCount = std::clamp<size_t>(displayCount, 16, n);
+    displayCount = std::clamp<size_t>(displayCount, 1, n);
 
-    float timeOffset = static_cast<float>(glfwGetTime()) * state.waveSpeed * static_cast<float>(n);
+    float timeOffset = static_cast<float>(glfwGetTime()) * state.simSpeed * state.waveSpeed * static_cast<float>(n);
     long baseIdx = static_cast<long>(timeOffset) % static_cast<long>(n);
 
     if (state.lineSmooth) {
@@ -342,9 +371,9 @@ ModeOutput buildMirroredWaveform(const std::vector<float>& samples, const VisSta
     const size_t n = smoothed.size();
 
     size_t displayCount = static_cast<size_t>(static_cast<float>(n) / state.waveZoom);
-    displayCount = std::clamp<size_t>(displayCount, 16, n);
+    displayCount = std::clamp<size_t>(displayCount, 1, n);
 
-    float timeOffset = static_cast<float>(glfwGetTime()) * state.waveSpeed * static_cast<float>(n);
+    float timeOffset = static_cast<float>(glfwGetTime()) * state.simSpeed * state.waveSpeed * static_cast<float>(n);
     long baseIdx = static_cast<long>(timeOffset) % static_cast<long>(n);
 
     std::vector<float> xs(displayCount), amps(displayCount);
@@ -383,7 +412,7 @@ ModeOutput buildMirroredWaveform(const std::vector<float>& samples, const VisSta
 
     out.linePrimitive = GL_LINE_STRIP;
     out.lineSegments  = {{0, static_cast<GLsizei>(displayCount)}};
-    out.lineGlow      = true;
+    out.lineGlow = true;
     out.fillAlpha     = 0.55f;
     return out;
 }
@@ -415,7 +444,7 @@ ModeOutput buildCircularOscilloscope(const std::vector<float>& samples, const Vi
 
     out.linePrimitive = GL_LINE_LOOP;
     out.lineSegments  = {{0, static_cast<GLsizei>(n)}};
-    out.lineGlow      = true;
+    out.lineGlow = true;
     return out;
 }
 
@@ -435,7 +464,7 @@ ModeOutput buildCircularSpectrumFilled(const std::vector<float>& magnitudes, std
 
     constexpr float innerRadius = 0.18f;
     constexpr size_t discSegments = 48;
-    const float pulse = (0.4f + 0.6f * avg) * (1.0f + 0.05f * std::sin(time * 2.0f));
+    const float pulse = (0.4f + 0.6f * avg) * (1.0f + 0.05f * state.centerSensitivity * std::sin(time * 2.0f));
     const float discRadius = innerRadius * pulse;
 
     const Color3 fillColor = resolveColor(state, Color3{0.55f * pulse, 0.2f * pulse, 0.85f * pulse}, 0.5f);
@@ -478,7 +507,7 @@ ModeOutput buildLissajous(const std::vector<float>& samples, const VisState& sta
 
     out.linePrimitive = GL_LINE_STRIP;
     out.lineSegments  = {{0, static_cast<GLsizei>(n)}};
-    out.lineGlow      = true;
+    out.lineGlow = true;
     return out;
 }
 
@@ -527,7 +556,7 @@ ModeOutput buildPulseRings(const std::vector<float>& magnitudes, std::vector<flo
     }
 
     out.linePrimitive = GL_LINE_LOOP;
-    out.lineGlow      = true;
+    out.lineGlow = true;
     return out;
 }
 
@@ -541,7 +570,7 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
     const std::vector<float> dsRight = downsample(right, count);
 
     size_t displayCount = static_cast<size_t>(static_cast<float>(count) / state.waveZoom);
-    displayCount = std::clamp<size_t>(displayCount, 64u, count);
+    displayCount = std::clamp<size_t>(displayCount, 1u, count);
 
     const Color3 baseColor = {0.2f, 1.0f, 0.3f};
 
@@ -559,10 +588,14 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
         case TrueXYMode::Scatter:
             out.lineVertices.reserve(displayCount * 6);
             for (const auto& p : pts)
-                pushVertex(out.lineVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, 3.0f);
+                pushVertex(out.lineVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, state.particleSize * 3.0f);
             out.linePrimitive = GL_POINTS;
             out.linePoints = true;
             out.lineSegments = {{0, static_cast<GLsizei>(displayCount)}};
+            if (state.bloom && state.bloomSteps > 0) {
+                for (const auto& p : pts)
+                    pushVertex(out.tipVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, state.bloomBallIntensity);
+            }
             break;
 
         case TrueXYMode::LineStrip: {
@@ -643,6 +676,11 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
                 pushVertex(out.fillVertices, a.x - nx, a.y - ny, a.c.r, a.c.g, a.c.b, 1.0f);
                 pushVertex(out.fillVertices, b.x + nx, b.y + ny, b.c.r, b.c.g, b.c.b, 1.0f);
                 pushVertex(out.fillVertices, b.x - nx, b.y - ny, b.c.r, b.c.g, b.c.b, 1.0f);
+                if (state.bloom && state.bloomSteps > 0) {
+                    float mx = (a.x + b.x) * 0.5f, my = (a.y + b.y) * 0.5f;
+                    float mr = (a.c.r + b.c.r) * 0.5f, mg = (a.c.g + b.c.g) * 0.5f, mb = (a.c.b + b.c.b) * 0.5f;
+                    pushVertex(out.tipVertices, mx, my, mr, mg, mb, state.bloomBallIntensity);
+                }
             }
             out.fillAlpha = 1.0f;
             break;
@@ -652,7 +690,7 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
             out.lineVertices.reserve(displayCount * 6);
             out.glowVertices.reserve(displayCount * 6 * 6);
             for (const auto& p : pts) {
-                pushVertex(out.lineVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, 4.0f);
+                pushVertex(out.lineVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, state.particleSize * 4.0f);
                 const float s = 0.006f;
                 pushVertex(out.glowVertices, p.x - s, p.y - s, p.c.r, p.c.g, p.c.b, 1.0f);
                 pushVertex(out.glowVertices, p.x + s, p.y - s, p.c.r, p.c.g, p.c.b, 1.0f);
@@ -660,6 +698,8 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
                 pushVertex(out.glowVertices, p.x - s, p.y - s, p.c.r, p.c.g, p.c.b, 1.0f);
                 pushVertex(out.glowVertices, p.x + s, p.y + s, p.c.r, p.c.g, p.c.b, 1.0f);
                 pushVertex(out.glowVertices, p.x - s, p.y + s, p.c.r, p.c.g, p.c.b, 1.0f);
+                if (state.bloom && state.bloomSteps > 0)
+                    pushVertex(out.tipVertices, p.x, p.y, p.c.r, p.c.g, p.c.b, state.bloomBallIntensity);
             }
             out.linePrimitive = GL_POINTS;
             out.linePoints = true;
@@ -667,7 +707,7 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
             break;
 
         case TrueXYMode::PhosphorTrail: {
-            const float time = static_cast<float>(glfwGetTime());
+            const float time = static_cast<float>(glfwGetTime()) * state.simSpeed;
             const float phase = time * state.waveSpeed;
             const long rawIdx = static_cast<long>(phase * static_cast<float>(displayCount));
             const long modIdx = rawIdx % static_cast<long>(displayCount);
@@ -684,7 +724,7 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
                 const float r = p.c.r * brightness;
                 const float g = p.c.g * brightness;
                 const float b = p.c.b * brightness;
-                pushVertex(out.lineVertices, p.x, p.y, r, g, b, 1.0f + 3.0f * fade);
+                pushVertex(out.lineVertices, p.x, p.y, r, g, b, state.particleSize * (1.0f + 3.0f * fade));
                 const float s = 0.003f + 0.004f * fade;
                 pushVertex(out.glowVertices, p.x - s, p.y - s, r, g, b, 1.0f);
                 pushVertex(out.glowVertices, p.x + s, p.y - s, r, g, b, 1.0f);
@@ -692,6 +732,8 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
                 pushVertex(out.glowVertices, p.x - s, p.y - s, r, g, b, 1.0f);
                 pushVertex(out.glowVertices, p.x + s, p.y + s, r, g, b, 1.0f);
                 pushVertex(out.glowVertices, p.x - s, p.y + s, r, g, b, 1.0f);
+                if (state.bloom && state.bloomSteps > 0)
+                    pushVertex(out.tipVertices, p.x, p.y, r, g, b, state.bloomBallIntensity * (0.3f + 0.7f * fade));
             }
             out.linePrimitive = GL_POINTS;
             out.linePoints = true;
@@ -702,6 +744,14 @@ ModeOutput buildTrueXY(const std::vector<float>& left, const std::vector<float>&
 
     }
 
+    if (state.bloom && state.bloomSteps > 0 && !out.linePoints) {
+        out.tipVertices.reserve(out.lineVertices.size() / 6 * 6);
+        for (size_t vi = 0; vi < out.lineVertices.size(); vi += 6) {
+            float x = out.lineVertices[vi], y = out.lineVertices[vi + 1];
+            float r = out.lineVertices[vi + 2], g = out.lineVertices[vi + 3], b = out.lineVertices[vi + 4];
+            pushVertex(out.tipVertices, x, y, r, g, b, state.bloomBallIntensity);
+        }
+    }
     out.lineGlow = true;
     return out;
 }
@@ -721,7 +771,7 @@ ModeOutput buildAnalogScope(const std::vector<float>& left, const std::vector<fl
     };
 
     out.lineWidth = 2.0f;
-    out.lineGlow  = true;
+    out.lineGlow = true;
     out.fillAlpha = 1.0f;
 
     const bool isTrace   = state.analogScopeMode == AnalogScopeMode::Trace;
@@ -781,7 +831,7 @@ ModeOutput buildAnalogScope(const std::vector<float>& left, const std::vector<fl
             const float age = static_cast<float>(interpLen - i) / static_cast<float>(interpLen);
             const float brightness = std::exp(-age * decayRate) * 0.95f + 0.05f;
             const Color3 c = resolveColor(state, baseColor, 1.0f - age);
-            pushVertex(out.lineVertices, p.x, p.y, c.r * brightness, c.g * brightness, c.b * brightness, 1.0f);
+            pushVertex(out.lineVertices, p.x, p.y, c.r * brightness, c.g * brightness, c.b * brightness, state.particleSize);
         }
         const GLsizei vertCount = static_cast<GLsizei>(out.lineVertices.size() / 6);
         if (vertCount > segStart) {
@@ -810,6 +860,382 @@ ModeOutput buildAnalogScope(const std::vector<float>& left, const std::vector<fl
         }
     }
 
+    // Bloom balls for trace vertices
+    if (state.bloom && state.bloomSteps > 0) {
+        if (!out.lineVertices.empty()) {
+            out.tipVertices.reserve(out.tipVertices.size() + out.lineVertices.size() / 6 * 6);
+            for (size_t vi = 0; vi < out.lineVertices.size(); vi += 6) {
+                float x = out.lineVertices[vi], y = out.lineVertices[vi + 1];
+                float r = out.lineVertices[vi + 2], g = out.lineVertices[vi + 3], b = out.lineVertices[vi + 4];
+                pushVertex(out.tipVertices, x, y, r, g, b, state.bloomBallIntensity * 0.5f);
+            }
+        }
+        if (!out.fillVertices.empty()) {
+            constexpr size_t floatsPerParticle = 36;
+            out.tipVertices.reserve(out.tipVertices.size() + out.fillVertices.size() / floatsPerParticle * 6);
+            for (size_t vi = 0; vi + 17 < out.fillVertices.size(); vi += floatsPerParticle) {
+                float x0 = out.fillVertices[vi];
+                float y0 = out.fillVertices[vi + 1];
+                float x2 = out.fillVertices[vi + 12];
+                float y2 = out.fillVertices[vi + 13];
+                float cx = (x0 + x2) * 0.5f;
+                float cy = (y0 + y2) * 0.5f;
+                float r = out.fillVertices[vi + 2];
+                float g = out.fillVertices[vi + 3];
+                float b = out.fillVertices[vi + 4];
+                pushVertex(out.tipVertices, cx, cy, r, g, b, state.bloomBallIntensity * 0.5f);
+            }
+        }
+    }
+    return out;
+}
+
+ModeOutput buildParticleField(const std::vector<float>& magnitudes, std::vector<float>& smoothedColumns, const VisState& state) {
+    ModeOutput out;
+    const size_t numBins = magnitudes.size();
+
+    size_t numParticles = std::min<size_t>(static_cast<size_t>(state.zoom * 200.0f), 12000);
+    numParticles = std::max<size_t>(numParticles, 64);
+
+    out.lineVertices.reserve(numParticles * 6);
+    if (state.bloom && state.bloomSteps > 0)
+        out.tipVertices.reserve(numParticles * 6);
+
+    const float time = static_cast<float>(glfwGetTime()) * state.simSpeed;
+    const float goldenAngle = 2.399963f;
+    const float energy = std::sqrt((magnitudes.empty() ? 0.0f : std::accumulate(magnitudes.begin(), magnitudes.end(), 0.0f) / static_cast<float>(numBins)));
+
+    for (size_t i = 0; i < numParticles; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(numParticles);
+        const float angle = t * goldenAngle * 25.0f + time * (0.3f + energy * 0.4f);
+        const float baseRadius = std::sqrt(t) * (0.55f + energy * 0.45f) * state.spiralGalaxyDistance;
+
+        size_t bin = static_cast<size_t>(t * static_cast<float>(numBins));
+        bin = std::min(bin, numBins - 1);
+        float mag = magnitudeToNormalized(magnitudes[bin], state.sensitivity);
+
+        const float pulse = 0.4f + 0.6f * mag;
+        const float radius = baseRadius * pulse;
+        const float x = std::cos(angle) * radius * state.aspect;
+        const float y = std::sin(angle) * radius;
+
+        const Color3 c = resolveColor(state, Color3{0.3f, 0.7f, 1.0f}, t);
+        pushVertex(out.lineVertices, x, y, c.r * 0.5f, c.g * 0.5f, c.b * 0.5f, state.particleSize * 2.0f);
+
+        if (state.bloom && state.bloomSteps > 0)
+            pushVertex(out.tipVertices, x, y, c.r, c.g, c.b, state.bloomBallIntensity * (0.3f + 0.7f * mag));
+    }
+
+    out.linePrimitive = GL_POINTS;
+    out.linePoints = true;
+    out.lineSegments = {{0, static_cast<GLsizei>(numParticles)}};
+    return out;
+}
+
+ModeOutput buildParticleGrid(const std::vector<float>& magnitudes, std::vector<float>& smoothedColumns, const VisState& state) {
+    ModeOutput out;
+    const size_t numBins = magnitudes.size();
+    const size_t cols = smoothedColumns.size();
+    constexpr size_t rows = 18;
+
+    out.tipVertices.reserve(cols * rows * 6);
+
+    for (size_t col = 0; col < cols; ++col) {
+        const auto [binStart, binEnd] = linearBinRange(numBins, cols, col);
+        const float mag = groupMagnitude(magnitudes, binStart, binEnd);
+        updateSmoothed(smoothedColumns[col], magnitudeToNormalized(mag, state.sensitivity), 0.6f, 0.08f);
+        const float level = std::pow(smoothedColumns[col], 0.5f);
+
+        const float x = -0.95f + (static_cast<float>(col) / static_cast<float>(cols - 1)) * 1.9f;
+
+        for (size_t row = 0; row < rows; ++row) {
+            const float normalizedRow = static_cast<float>(row) / static_cast<float>(rows - 1);
+            const float y = -0.9f + normalizedRow * 1.8f;
+
+            Color3 c = resolveColor(state, Color3{0.1f, 1.0f, 0.3f}, normalizedRow);
+            float intensity = state.bloomBallIntensity;
+            if (normalizedRow > level) {
+                c = state.bgBloomColor;
+                intensity = state.bgBloomIntensity;
+            }
+            pushVertex(out.tipVertices, x, y, c.r, c.g, c.b, intensity);
+        }
+    }
+
+    return out;
+}
+
+ModeOutput buildLedBars(const std::vector<float>& magnitudes, std::vector<float>& smoothedHeights, const VisState& state) {
+    ModeOutput out;
+    const size_t numBins = magnitudes.size();
+    const size_t numBars = smoothedHeights.size();
+    constexpr size_t segments = 14;
+
+    constexpr float left = -0.97f, right = 0.97f, bottom = -0.92f, top = 0.92f;
+    const float barWidth = (right - left) / static_cast<float>(numBars);
+    const float barGap = barWidth * 0.2f;
+    const float totalHeight = top - bottom;
+    const float segHeight = totalHeight / static_cast<float>(segments);
+    const float segGap = segHeight * 0.18f;
+
+    out.fillVertices.reserve(numBars * segments * 6 * 6);
+    if (state.bloom && state.bloomSteps > 0)
+        out.tipVertices.reserve(numBars * static_cast<size_t>(state.bloomSteps) * 6);
+
+    for (size_t bar = 0; bar < numBars; ++bar) {
+        const auto [binStart, binEnd] = linearBinRange(numBins, numBars, bar);
+        const float mag = groupMagnitude(magnitudes, binStart, binEnd);
+        updateSmoothed(smoothedHeights[bar], magnitudeToNormalized(mag, state.sensitivity), 0.6f, 0.1f);
+        const float h = std::pow(smoothedHeights[bar], 0.5f);
+
+        const float x0 = left + static_cast<float>(bar) * barWidth + barGap * 0.5f;
+        const float x1 = x0 + barWidth - barGap;
+
+        const size_t litSegments = static_cast<size_t>(h * static_cast<float>(segments) + 0.5f);
+
+        for (size_t s = 0; s < litSegments && s < segments; ++s) {
+            const float y0 = bottom + static_cast<float>(s) * segHeight + segGap * 0.5f;
+            const float y1 = y0 + segHeight - segGap;
+
+            const float frac = static_cast<float>(s) / static_cast<float>(segments);
+            const Color3 c = resolveColor(state, Color3{1.0f, 1.0f, 1.0f}, frac);
+
+            pushVertex(out.fillVertices, x0, y0, c.r, c.g, c.b, 1.0f);
+            pushVertex(out.fillVertices, x1, y0, c.r, c.g, c.b, 1.0f);
+            pushVertex(out.fillVertices, x1, y1, c.r, c.g, c.b, 1.0f);
+
+            pushVertex(out.fillVertices, x0, y0, c.r, c.g, c.b, 1.0f);
+            pushVertex(out.fillVertices, x1, y1, c.r, c.g, c.b, 1.0f);
+            pushVertex(out.fillVertices, x0, y1, c.r, c.g, c.b, 1.0f);
+        }
+
+        if (state.bloom && state.bloomSteps > 0 && litSegments > 0) {
+            const float xc = (x0 + x1) * 0.5f;
+            const float tipY1 = bottom + static_cast<float>(litSegments - 1) * segHeight + segHeight - segGap;
+            const float gradPos = static_cast<float>(litSegments) / static_cast<float>(segments);
+            const Color3 tc = resolveColor(state, Color3{1.0f, 1.0f, 1.0f}, gradPos);
+            int bloomCount = std::max(1, static_cast<int>(state.bloomSteps * state.bloomBallAmount));
+            for (int si = 0; si < bloomCount; ++si) {
+                const float stepT = static_cast<float>(si + 1) / static_cast<float>(bloomCount);
+                const float yStep = bottom + stepT * (tipY1 - bottom);
+                pushVertex(out.tipVertices, xc, yStep, tc.r, tc.g, tc.b,
+                           state.bloomBallIntensity * h);
+            }
+        }
+    }
+
+    out.fillAlpha = 1.0f;
+    return out;
+}
+
+ModeOutput buildMirroredDenseSpectrum(const std::vector<float>& magnitudes, std::vector<float>& smoothedHeights, const VisState& state) {
+    ModeOutput out;
+    const size_t numBins = magnitudes.size();
+    const size_t numBars = smoothedHeights.size();
+
+    constexpr float center = 0.0f;
+    constexpr float top = 0.92f;
+    constexpr float left = -0.98f, right = 0.98f;
+    const float barWidth = (right - left) / static_cast<float>(numBars);
+    constexpr float gapFraction = 0.0f;
+    const float gap = barWidth * gapFraction;
+
+    out.fillVertices.reserve(numBars * 2 * 6 * 6);
+    out.lineVertices.reserve(numBars * 2 * 6);
+    if (state.bloom) {
+        out.glowVertices.reserve(numBars * 4 * 12 * 6);
+        if (state.bloomSteps > 0)
+            out.tipVertices.reserve(numBars * 2 * static_cast<size_t>(state.bloomSteps) * 6);
+    }
+
+    for (size_t bar = 0; bar < numBars; ++bar) {
+        const float t = static_cast<float>(bar) / static_cast<float>(numBars);
+        
+        const auto [binStart, binEnd] = linearBinRange(numBins, numBars, bar);
+        const float mag = groupMagnitude(magnitudes, binStart, binEnd);
+        
+        updateSmoothed(smoothedHeights[bar], magnitudeToNormalized(mag, state.sensitivity), 0.5f, 0.15f);
+        const float h = smoothedHeights[bar];
+
+        const float x0 = left + static_cast<float>(bar) * barWidth + gap * 0.5f;
+        const float x1 = x0 + barWidth - gap;
+        const float yExtent = center + h * (top - center);
+
+        const Color3 bottomColor = resolveColor(state, Color3{0.0f, 0.25f, 0.35f}, t);
+        const Color3 topColor    = resolveColor(state, Color3{0.3f + 0.6f * h, 1.0f, 1.0f}, t);
+
+        const float xc = (x0 + x1) * 0.5f;
+
+        // Top bar
+        pushVertex(out.fillVertices, x0, center,   bottomColor.r, bottomColor.g, bottomColor.b, 1.0f);
+        pushVertex(out.fillVertices, x1, center,   bottomColor.r, bottomColor.g, bottomColor.b, 1.0f);
+        pushVertex(out.fillVertices, x1, yExtent,  topColor.r, topColor.g, topColor.b, 1.0f);
+        pushVertex(out.fillVertices, x0, center,   bottomColor.r, bottomColor.g, bottomColor.b, 1.0f);
+        pushVertex(out.fillVertices, x1, yExtent,  topColor.r, topColor.g, topColor.b, 1.0f);
+        pushVertex(out.fillVertices, x0, yExtent,  topColor.r, topColor.g, topColor.b, 1.0f);
+
+        // Bottom bar (mirrored)
+        pushVertex(out.fillVertices, x0, center,      bottomColor.r, bottomColor.g, bottomColor.b, 1.0f);
+        pushVertex(out.fillVertices, x1, center,      bottomColor.r, bottomColor.g, bottomColor.b, 1.0f);
+        pushVertex(out.fillVertices, x1, -yExtent,    topColor.r, topColor.g, topColor.b, 1.0f);
+        pushVertex(out.fillVertices, x0, center,      bottomColor.r, bottomColor.g, bottomColor.b, 1.0f);
+        pushVertex(out.fillVertices, x1, -yExtent,    topColor.r, topColor.g, topColor.b, 1.0f);
+        pushVertex(out.fillVertices, x0, -yExtent,    topColor.r, topColor.g, topColor.b, 1.0f);
+
+        // Line tips
+            pushVertex(out.lineVertices, xc, yExtent,  topColor.r, topColor.g, topColor.b, state.particleSize);
+            pushVertex(out.lineVertices, xc, -yExtent, topColor.r, topColor.g, topColor.b, state.particleSize);
+
+        // Glow + bloom
+        if (state.bloom) {
+            appendBarGlow(out.glowVertices, x0, x1, center, yExtent, topColor, state.bloomSize);
+            appendBarGlow(out.glowVertices, x0, x1, -center, -yExtent, topColor, state.bloomSize);
+
+            if (state.bloomSteps > 0) {
+                int bloomCount = std::max(1, static_cast<int>(state.bloomSteps * state.bloomBallAmount));
+                for (int si = 0; si < bloomCount; ++si) {
+                    const float stepT = static_cast<float>(si + 1) / static_cast<float>(bloomCount);
+                    const float yStep = center + stepT * (yExtent - center);
+                    const Color3 bc = resolveColor(state, topColor, stepT);
+                    pushVertex(out.tipVertices, xc, yStep,  bc.r, bc.g, bc.b, state.bloomBallIntensity * h);
+                    pushVertex(out.tipVertices, xc, -yStep, bc.r, bc.g, bc.b, state.bloomBallIntensity * h);
+                }
+            }
+        }
+    }
+
+    out.linePrimitive = GL_POINTS;
+    out.linePoints    = true;
+    out.lineSegments  = {{0, static_cast<GLsizei>(numBars * 2)}};
+    out.lineGlow = true;
+    out.fillAlpha     = 1.0f;
+    return out;
+}
+
+ModeOutput buildCircularMesh(const std::vector<float>& magnitudes, std::vector<float>& smoothedHeights, const VisState& state) {
+    ModeOutput out;
+    const size_t numBins = magnitudes.size();
+    const size_t numBars = smoothedHeights.size();
+
+    constexpr float innerRadius = 0.18f;
+    constexpr float maxOuterRadius = 0.46f;
+
+    out.fillVertices.reserve(numBars * 6 * 6);
+    out.lineVertices.reserve(numBars * 6);
+    if (state.bloom) {
+        out.glowVertices.reserve(numBars * 6 * 6);
+        if (state.bloomSteps > 0)
+            out.tipVertices.reserve(numBars * static_cast<size_t>(state.bloomSteps) * 6);
+    }
+
+    // Precompute vertex ring positions
+    struct RingPt { float x, y; Color3 c; };
+    std::vector<RingPt> outerRing(numBars);
+    std::vector<RingPt> innerRing(numBars);
+
+    for (size_t i = 0; i < numBars; ++i) {
+        const float angle = (static_cast<float>(i) / static_cast<float>(numBars)) * 2.0f * kPi;
+
+        const auto [binStart, binEnd] = linearBinRange(numBins, numBars, i);
+        const float mag = groupMagnitude(magnitudes, binStart, binEnd);
+        updateSmoothed(smoothedHeights[i], magnitudeToNormalized(mag, state.sensitivity), 0.5f, 0.15f);
+        const float h = smoothedHeights[i];
+
+        const float outerRadius = innerRadius + h * (maxOuterRadius - innerRadius);
+        const float t = static_cast<float>(i) / static_cast<float>(numBars);
+
+        const Color3 innerColor = resolveColor(state, Color3{0.6f, 0.15f, 0.0f}, t);
+        const Color3 outerColor = resolveColor(state, Color3{1.0f, 0.55f + 0.45f * h, 0.1f}, t);
+
+        innerRing[i] = {innerRadius * std::cos(angle) * state.aspect, innerRadius * std::sin(angle), innerColor};
+        outerRing[i] = {outerRadius * std::cos(angle) * state.aspect, outerRadius * std::sin(angle), outerColor};
+    }
+
+    // Fill: triangle strip around the ring (2 triangles per segment)
+    for (size_t i = 0; i < numBars; ++i) {
+        const size_t ni = (i + 1) % numBars;
+
+        pushVertex(out.fillVertices, innerRing[i].x,  innerRing[i].y,  innerRing[i].c.r, innerRing[i].c.g, innerRing[i].c.b, 1.0f);
+        pushVertex(out.fillVertices, innerRing[ni].x, innerRing[ni].y, innerRing[ni].c.r, innerRing[ni].c.g, innerRing[ni].c.b, 1.0f);
+        pushVertex(out.fillVertices, outerRing[ni].x, outerRing[ni].y, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, 1.0f);
+
+        pushVertex(out.fillVertices, innerRing[i].x,  innerRing[i].y,  innerRing[i].c.r, innerRing[i].c.g, innerRing[i].c.b, 1.0f);
+        pushVertex(out.fillVertices, outerRing[ni].x, outerRing[ni].y, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, 1.0f);
+        pushVertex(out.fillVertices, outerRing[i].x,  outerRing[i].y,  outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, 1.0f);
+    }
+
+    // Line loop: outer ring edge
+    for (size_t i = 0; i < numBars; ++i) {
+        pushVertex(out.lineVertices, outerRing[i].x, outerRing[i].y, outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, 1.0f);
+    }
+
+    // Mode 8 bloom: concentric scaled mesh copies (no per-bar bloom balls)
+    if (state.bloom && state.bloomSteps > 0) {
+        int bloomCount = std::max(1, static_cast<int>(state.bloomSteps * state.bloomBallAmount));
+        out.glowVertices.reserve(numBars * 6 * 6 * static_cast<size_t>(bloomCount) + 144);
+        for (int si = 0; si < bloomCount; ++si) {
+            const float stepT = static_cast<float>(si + 1) / static_cast<float>(bloomCount);
+            const float scale = 1.0f + stepT * state.bloomSize * 0.5f;
+            const float alpha = 1.0f - stepT * 0.6f;
+            for (size_t i = 0; i < numBars; ++i) {
+                const size_t ni = (i + 1) % numBars;
+                const float outerR = std::sqrt(outerRing[i].x * outerRing[i].x + outerRing[i].y * outerRing[i].y);
+                const float outerA = std::atan2(outerRing[i].y, outerRing[i].x);
+                const float ox = outerR * scale * std::cos(outerA);
+                const float oy = outerR * scale * std::sin(outerA);
+                const float outerRn = std::sqrt(outerRing[ni].x * outerRing[ni].x + outerRing[ni].y * outerRing[ni].y);
+                const float outerAn = std::atan2(outerRing[ni].y, outerRing[ni].x);
+                const float oxn = outerRn * scale * std::cos(outerAn);
+                const float oyn = outerRn * scale * std::sin(outerAn);
+                pushVertex(out.glowVertices, innerRing[i].x, innerRing[i].y, outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, alpha);
+                pushVertex(out.glowVertices, innerRing[ni].x, innerRing[ni].y, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, alpha);
+                pushVertex(out.glowVertices, oxn, oyn, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, alpha);
+                pushVertex(out.glowVertices, innerRing[i].x, innerRing[i].y, outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, alpha);
+                pushVertex(out.glowVertices, oxn, oyn, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, alpha);
+                pushVertex(out.glowVertices, ox, oy, outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, alpha);
+            }
+        }
+    } else if (state.bloom) {
+        // bloomSteps == 0: single expanded glow + center radiation
+        out.glowVertices.reserve(numBars * 6 * 6 + 144);
+        const float gs = 1.0f + state.bloomSize * 0.3f;
+        for (size_t i = 0; i < numBars; ++i) {
+            const size_t ni = (i + 1) % numBars;
+            const float r = std::sqrt(outerRing[i].x * outerRing[i].x + outerRing[i].y * outerRing[i].y);
+            const float a = std::atan2(outerRing[i].y, outerRing[i].x);
+            const float ox = r * gs * std::cos(a);
+            const float oy = r * gs * std::sin(a);
+            const float rn = std::sqrt(outerRing[ni].x * outerRing[ni].x + outerRing[ni].y * outerRing[ni].y);
+            const float an = std::atan2(outerRing[ni].y, outerRing[ni].x);
+            const float oxn = rn * gs * std::cos(an);
+            const float oyn = rn * gs * std::sin(an);
+            pushVertex(out.glowVertices, innerRing[i].x, innerRing[i].y, outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, 1.0f);
+            pushVertex(out.glowVertices, innerRing[ni].x, innerRing[ni].y, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, 1.0f);
+            pushVertex(out.glowVertices, oxn, oyn, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, 1.0f);
+            pushVertex(out.glowVertices, innerRing[i].x, innerRing[i].y, outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, 1.0f);
+            pushVertex(out.glowVertices, oxn, oyn, outerRing[ni].c.r, outerRing[ni].c.g, outerRing[ni].c.b, 1.0f);
+            pushVertex(out.glowVertices, ox, oy, outerRing[i].c.r, outerRing[i].c.g, outerRing[i].c.b, 1.0f);
+        }
+        // Center light radiation: pulsing additive disc
+        float avg = 0.0f;
+        for (float h : smoothedHeights) avg += h;
+        avg /= static_cast<float>(std::max<size_t>(smoothedHeights.size(), 1));
+        constexpr size_t radSegs = 24;
+        const float radRadius = innerRadius * (0.3f + 0.7f * avg);
+        const Color3 rc = resolveColor(state, Color3{0.8f, 0.4f, 0.0f}, 0.5f);
+        for (size_t j = 0; j < radSegs; ++j) {
+            const float a0 = (static_cast<float>(j) / static_cast<float>(radSegs)) * 2.0f * kPi;
+            const float a1 = (static_cast<float>(j + 1) / static_cast<float>(radSegs)) * 2.0f * kPi;
+            pushVertex(out.glowVertices, 0.0f, 0.0f, rc.r, rc.g, rc.b, 1.0f);
+            pushVertex(out.glowVertices, radRadius * std::cos(a0) * state.aspect, radRadius * std::sin(a0), rc.r, rc.g, rc.b, 1.0f);
+            pushVertex(out.glowVertices, radRadius * std::cos(a1) * state.aspect, radRadius * std::sin(a1), rc.r, rc.g, rc.b, 1.0f);
+        }
+    }
+
+    out.linePrimitive = GL_LINE_LOOP;
+    out.lineSegments  = {{0, static_cast<GLsizei>(numBars)}};
+    out.lineGlow = true;
+    out.fillAlpha = 0.85f;
     return out;
 }
 

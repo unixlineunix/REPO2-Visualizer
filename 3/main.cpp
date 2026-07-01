@@ -8,6 +8,9 @@
 #include "fft.hxx"
 #include "modes.hxx"
 #include "shader.hxx"
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -15,7 +18,9 @@
 #include <iostream>
 #include <vector>
 
+#ifndef _GLFW_WIN32
 #include <webp/decode.h>
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -93,6 +98,7 @@ GLuint loadTexture(const char *path, int &w, int &h) {
   }
 
   const char *ext = std::strrchr(path, '.');
+#ifndef _GLFW_WIN32
   if (ext &&
       (std::strcmp(ext, ".webp") == 0 || std::strcmp(ext, ".WEBP") == 0)) {
     FILE *f = fopen(path, "rb");
@@ -135,6 +141,7 @@ GLuint loadTexture(const char *path, int &w, int &h) {
     WebPFree(data);
     return tex;
   }
+#endif
 
   std::cerr << "Failed to load: " << path << "\n";
   return 0;
@@ -175,16 +182,18 @@ int main(int argc, char **argv) {
   const char *img5Path = nullptr;
   bool experimental4 = false;
   bool bgBackground = false;
+  bool noControl = false;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--help") == 0 ||
         std::strcmp(argv[i], "-h") == 0) {
       std::cout
-          << "Usage: visualizer [options]\n"
+          << "Usage: vizl [options]\n"
           << "  --img5 <path>        Image overlay for circular modes 4/5\n"
           << "  --bg-image <path>    Background image\n"
           << "  --bg-background      Enable background image\n"
           << "  --experimental 4     Enable experimental mode 4 image\n"
+          << "  --no-control         Start with control panel hidden\n"
           << "  --help, -h           Show this help\n";
       return 0;
     } else if (std::strcmp(argv[i], "--bg-image") == 0 && i + 1 < argc)
@@ -195,14 +204,17 @@ int main(int argc, char **argv) {
       experimental4 = (std::strcmp(argv[++i], "4") == 0);
     else if (std::strcmp(argv[i], "--bg-background") == 0)
       bgBackground = true;
+    else if (std::strcmp(argv[i], "--no-control") == 0)
+      noControl = true;
     else {
       std::cerr << "Unknown argument: " << argv[i] << "\n";
       std::cerr
-          << "Usage: visualizer [options]\n"
+          << "Usage: vizl [options]\n"
           << "  --img5 <path>        Image overlay for circular modes 4/5\n"
           << "  --bg-image <path>    Background image\n"
           << "  --bg-background      Enable background image\n"
           << "  --experimental 4     Enable experimental mode 4 image\n"
+          << "  --no-control         Start with control panel hidden\n"
           << "  --help, -h           Show this help\n";
       return 1;
     }
@@ -225,7 +237,7 @@ int main(int argc, char **argv) {
   int winH = vm->height * 3 / 4;
 
   GLFWwindow *window =
-      glfwCreateWindow(winW, winH, "Audio Visualizer", nullptr, nullptr);
+      glfwCreateWindow(winW, winH, "vizl", nullptr, nullptr);
   if (!window) {
     std::cerr << "Failed to create GLFW window\n";
     glfwTerminate();
@@ -251,6 +263,13 @@ int main(int argc, char **argv) {
   glViewport(0, 0, fbW, fbH);
   glEnable(GL_BLEND);
   glEnable(GL_PROGRAM_POINT_SIZE);
+
+  IMGUI_CHECKVERSION();
+  ImGui::CreateContext();
+  ImGuiIO& io = ImGui::GetIO();
+  ImGui::StyleColorsDark();
+  ImGui_ImplGlfw_InitForOpenGL(window, true);
+  ImGui_ImplOpenGL3_Init("#version 460");
 
   AudioCapture captureMic(RING_BUFFER_SIZE, false);
   AudioCapture captureSys(RING_BUFFER_SIZE, true);
@@ -343,6 +362,9 @@ int main(int argc, char **argv) {
   bool prevSemicolon = false;
   bool prevLeftBracket = false, prevRightBracket = false;
   bool prevSlash = false, prevBackslash = false;
+  bool prevC = false, prevRAlt = false;
+  bool open = true;
+  if (noControl) open = false;
 
   std::vector<float> sampleBuffer(FFT_SIZE);
   std::vector<float> tempBuffer(FFT_SIZE);
@@ -429,6 +451,10 @@ int main(int argc, char **argv) {
   };
 
   while (!glfwWindowShouldClose(window)) {
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
     for (int k = 0; k < 9; ++k) {
       bool down = glfwGetKey(window, GLFW_KEY_1 + k) == GLFW_PRESS;
       if (down && !prevNumKeys[k]) {
@@ -643,6 +669,17 @@ int main(int argc, char **argv) {
     prevSlash = slashDown;
     prevBackslash = backslashDown;
 
+    const bool cDown = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
+    if (cDown && !prevC)
+      open = !open;
+    prevC = cDown;
+
+    const bool altDown = glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS ||
+                          glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS;
+    if (altDown && !prevRAlt)
+      open = !open;
+    prevRAlt = altDown;
+
     // Read audio
     if (micRunning && sysRunning) {
       captureMic.readLatest(sampleBuffer.data(), FFT_SIZE);
@@ -821,10 +858,142 @@ int main(int argc, char **argv) {
       glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
 
+    // ── ImGui control panel ──
+    if (open) {
+      ImGui::Begin("vizl", &open, ImGuiWindowFlags_NoCollapse);
+
+      const char* modes[] = {"1: Oscilloscope","2: Spectrum Bars","3: Mirrored Waveform","4: Circular Oscilloscope","5: Circular Spectrum","6: Lissajous","7: Particle Field","8: LED Bars","9: Pulse Rings"};
+      int curMode = static_cast<int>(mode) - 1;
+      if (ImGui::Combo("Mode", &curMode, modes, 9)) {
+        mode = static_cast<VisMode>(curMode + 1);
+        std::cout << "Mode: " << modeName(mode) << "\n";
+      }
+
+      ImGui::Checkbox("Bloom", &bloomEnabled);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("L key");
+
+      float bi = modes::bloomIntensity();
+      if (ImGui::SliderFloat("Intensity", &bi, 1.0f, 600.0f)) {
+        modes::setBloomIntensity(bi);
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("[ / ] keys");
+
+      int br = modes::bloomRings();
+      if (ImGui::SliderInt("Rings", &br, 1, 100)) {
+        modes::setBloomRings(br);
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("/ / \\ keys");
+
+      int bs = modes::bloomSteps();
+      if (ImGui::SliderInt("Steps", &bs, 1, 20)) {
+        modes::setBloomSteps(bs);
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("` / ' keys");
+
+      ImGui::Separator();
+      ImGui::SliderFloat("Zoom", &zoom, 0.2f, 10.0f);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("- / = keys");
+
+      ImGui::SliderFloat("Sensitivity", &sensitivity, 0.1f, 10000.0f);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Up / Down arrows");
+
+      ImGui::Checkbox("Antialiasing", &antialiasing);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("A key");
+
+      ImGui::Checkbox("Color Fill", &colorFill);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("V key");
+
+      ImGui::Separator();
+      const char* srcs[] = {"Mic", "System", "Both"};
+      int curSrc = static_cast<int>(audioSrc);
+      if (ImGui::Combo("Audio Source", &curSrc, srcs, 3)) {
+        if (curSrc != static_cast<int>(audioSrc)) {
+          audioSrc = static_cast<AudioSrc>(curSrc);
+          micRunning = false; sysRunning = false; captureMic.stop(); captureSys.stop();
+          if (audioSrc == AudioSrc::Mic || audioSrc == AudioSrc::Both) micRunning = captureMic.start();
+          if (audioSrc == AudioSrc::Sys || audioSrc == AudioSrc::Both) sysRunning = captureSys.start();
+          std::cout << "Audio source: " << (audioSrc == AudioSrc::Mic ? "Mic" : audioSrc == AudioSrc::Sys ? "System" : "Both") << "\n";
+        }
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("S / Z keys");
+
+      bool muted = !micRunning;
+      if (ImGui::Checkbox("Mic Muted", &muted)) {
+        if (muted) { micRunning = false; captureMic.stop(); std::cout << "Mic muted\n"; }
+        else { micRunning = captureMic.start(); std::cout << "Mic unmuted\n"; }
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("M key");
+
+      ImGui::Separator();
+      if (ImGui::Button("Randomize Gradient")) {
+        modes::randomizeGradient();
+        std::cout << "Gradient randomized\n";
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("G key");
+
+      if (ImGui::Button("Randomize Color")) {
+        modes::randomizeFlat();
+        std::cout << "Color randomized\n";
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("R key");
+
+      int pc = modes::paletteCount();
+      if (ImGui::SliderInt("Palette Stops", &pc, 1, 20)) {
+        modes::setPaletteCount(pc);
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip(", / . keys");
+
+      ImGui::Separator();
+      if (mode == VisMode::SpectrumBars || mode == VisMode::CircularSpectrum ||
+          mode == VisMode::ParticleField || mode == VisMode::LedBars) {
+        int barCount = 0;
+        switch (mode) {
+          case VisMode::SpectrumBars: barCount = static_cast<int>(spectrumHeights.size()); break;
+          case VisMode::CircularSpectrum: barCount = static_cast<int>(circularSpectrumHeights.size()); break;
+          case VisMode::ParticleField: barCount = static_cast<int>(particleColumns.size()); break;
+          case VisMode::LedBars: barCount = static_cast<int>(ledHeights.size()); break;
+          default: break;
+        }
+        if (ImGui::SliderInt(mode == VisMode::ParticleField ? "Columns" : "Bars", &barCount, 4, 400)) {
+          switch (mode) {
+            case VisMode::SpectrumBars: spectrumHeights.assign(barCount, 0.0f); break;
+            case VisMode::CircularSpectrum: circularSpectrumHeights.assign(barCount, 0.0f); break;
+            case VisMode::ParticleField: particleColumns.assign(barCount, 0.0f); break;
+            case VisMode::LedBars: ledHeights.assign(barCount, 0.0f); break;
+            default: break;
+          }
+          std::cout << (mode == VisMode::ParticleField ? "Columns" : "Bars") << ": " << barCount << "\n";
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Left / Right arrows");
+      }
+
+      if (mode == VisMode::PulseRings) {
+        int rc = modes::ringCount();
+        if (ImGui::SliderInt("Pulse Rings", &rc, 1, 20)) {
+          modes::setRingCount(rc);
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Left / Right arrows");
+      }
+
+      ImGui::Separator();
+      ImGui::Text("vizl v3 - ImGui panel");
+      ImGui::Text("RAlt to toggle");
+
+      ImGui::End();
+    }
+
+    // ── ImGui render ──
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
     glBindVertexArray(0);
     glfwSwapBuffers(window);
     glfwPollEvents();
   }
+
+  ImGui_ImplOpenGL3_Shutdown();
+  ImGui_ImplGlfw_Shutdown();
+  ImGui::DestroyContext();
 
   captureMic.stop();
   captureSys.stop();
